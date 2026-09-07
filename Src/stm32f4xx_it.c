@@ -203,7 +203,7 @@ void OTG_FS_IRQHandler(void)
 
 #include "tim.h"
 
-/* TIM1 捕获/比较中断（PWM2 脉冲输入 PE11，白线 FG 测速）
+/* TIM1 捕获/比较中断（PWM1~PWM4 脉冲输入）
  * 注：只使用 CC 中断，不使用 TIM1 更新中断（TIM1_UP_TIM10） */
 void TIM1_CC_IRQHandler(void)
 {

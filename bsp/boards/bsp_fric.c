@@ -14,11 +14,13 @@ static uint32_t s_stop_timer  = 0;   /* 停机延时计时 */
 #define RAMP_STEP        1     /* 步进 1%，0->100% 约 5s */
 #define STOP_DELAY_MS    200   /* PWM 归零后保持 200ms 再断 EN */
 
-/* 内部：写 TIM8_CH1 的 CCR (0~100)，对应 PC6 = C板 PWM5 接口 */
+/* 内部：同步写 TIM8_CH1~CH3 的 CCR (0~100)，对应 C板 PWM5~PWM7 */
 static void fric_apply_ccr(uint16_t cmd)
 {
-    /* TIM8 Period=99，CCR 范围 0~100，cmd 直接等于占空比百分比 */
+    /* TIM8 Period=99，CCR 范围 0~100，三个输出保持相同占空比 */
     __HAL_TIM_SetCompare(&htim8, TIM_CHANNEL_1, cmd);
+    __HAL_TIM_SetCompare(&htim8, TIM_CHANNEL_2, cmd);
+    __HAL_TIM_SetCompare(&htim8, TIM_CHANNEL_3, cmd);
 }
 
 /* 旧 API：关闭摩擦轮/风机（占空比 0） */

@@ -384,31 +384,31 @@ static void cdc_process_command(const uint8_t *line, uint16_t len)
   /* STATUS */
   if (str_ieq("STATUS", line, len))
   {
-    static char buf[110];
+    static char buf[240];
     const char *st[] = {"IDLE", "RUN", "STOPPING"};
     int n;
-    if (pulse_is_valid())
-    {
-      /* 白线 FG 测速：FREQ=脉冲频率Hz RPM=转速 CNT=累计脉冲数 */
-      n = snprintf(buf, sizeof(buf),
-                    "STATE=%s DUTY=%u TARGET=%u FREQ=%lu RPM=%lu CNT=%lu PPR=%u\r\n",
-                    st[fan_get_state()],
-                    fan_get_current_duty(),
-                    fan_get_target_duty(),
-                    (unsigned long)pulse_get_freq_hz(),
-                    (unsigned long)pulse_get_rpm(s_pulses_per_rev),
-                    (unsigned long)pulse_get_pulse_count(),
-                    (unsigned)s_pulses_per_rev);
-    }
-    else
-    {
-      n = snprintf(buf, sizeof(buf),
-                    "STATE=%s DUTY=%u TARGET=%u FREQ=0 RPM=0 CNT=0 PPR=%u\r\n",
-                    st[fan_get_state()],
-                    fan_get_current_duty(),
-                    fan_get_target_duty(),
-                    (unsigned)s_pulses_per_rev);
-    }
+    n = snprintf(buf, sizeof(buf),
+                 "STATE=%s DUTY=%u TARGET=%u "
+                 "FREQ1=%lu RPM1=%lu CNT1=%lu "
+                 "FREQ2=%lu RPM2=%lu CNT2=%lu "
+                 "FREQ3=%lu RPM3=%lu CNT3=%lu "
+                 "FREQ4=%lu RPM4=%lu CNT4=%lu PPR=%u\r\n",
+                 st[fan_get_state()],
+                 fan_get_current_duty(),
+                 fan_get_target_duty(),
+                 (unsigned long)pulse_get_freq_hz(1),
+                 (unsigned long)pulse_get_rpm(1, s_pulses_per_rev),
+                 (unsigned long)pulse_get_pulse_count(1),
+                 (unsigned long)pulse_get_freq_hz(2),
+                 (unsigned long)pulse_get_rpm(2, s_pulses_per_rev),
+                 (unsigned long)pulse_get_pulse_count(2),
+                 (unsigned long)pulse_get_freq_hz(3),
+                 (unsigned long)pulse_get_rpm(3, s_pulses_per_rev),
+                 (unsigned long)pulse_get_pulse_count(3),
+                 (unsigned long)pulse_get_freq_hz(4),
+                 (unsigned long)pulse_get_rpm(4, s_pulses_per_rev),
+                 (unsigned long)pulse_get_pulse_count(4),
+                 (unsigned)s_pulses_per_rev);
     (void)n;
     cdc_reply(buf);
     return;

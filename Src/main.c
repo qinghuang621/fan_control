@@ -101,15 +101,17 @@ int main(void)
   MX_USB_DEVICE_Init();
   /* USER CODE BEGIN 2 */
 
-    /* 启动 TIM8 CH1 PWM 输出（风机调速, PC6 = C板 PWM5 接口） */
+    /* 启动 TIM8 CH1~CH3 PWM 输出（C板 PWM5~PWM7，20kHz） */
     HAL_TIM_Base_Start(&htim8);
     HAL_TIM_PWM_Start(&htim8, TIM_CHANNEL_1);
+    HAL_TIM_PWM_Start(&htim8, TIM_CHANNEL_2);
+    HAL_TIM_PWM_Start(&htim8, TIM_CHANNEL_3);
 
     /* 上电默认安全状态：EN=0, PWM=0 */
     fric_en_off();
     fric_off();
 
-    /* 启动 PWM2(PE11) 脉冲输入捕获（白线 FG 测速，窗口计数法，仅 CC2 中断） */
+    /* 启动 PWM1~PWM4(PE9/PE11/PE13/PE14) 四路 FG 脉冲输入捕获 */
     pulse_capture_init();
 
     /* 初始化板载 RGB LED（TIM5 + PH10/PH11/PH12），开启彩虹渐变+呼吸 */
