@@ -1,0 +1,24 @@
+# CMake build output
+build/
+
+# IDE and tool-generated files
+.vs/
+*.uvguix.*
+*.uvoptx
+
+# Compiled firmware and intermediate files
+*.elf
+*.hex
+*.bin
+*.map
+*.o
+*.obj
+*.su
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Local secrets and environment files
+.env
+.env.*

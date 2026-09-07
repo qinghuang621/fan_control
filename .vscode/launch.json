@@ -1,0 +1,30 @@
+{
+    "version": "2.0.0",
+    "configurations": [
+        {
+            "name": "Flash & Debug (OpenOCD)",
+            "type": "cortex-debug",
+            "request": "launch",
+            "cwd": "${workspaceFolder}",
+            "executable": "${workspaceFolder}/build/Debug/pwm_snail.elf",
+            "preLaunchTask": "Build (CMake)",
+            "servertype": "openocd",
+            "configFiles": ["${workspaceFolder}/openocd.cfg"],
+            "searchDir": ["${workspaceFolder}"],
+            "runToEntryPoint": "main",
+            "showDevDebugOutput": "raw",
+            "svdFile": "${env:USERPROFILE}/.vscode/extensions/marus25.cortex-debug-*/data/svd/STM32F407.svd"
+        },
+        {
+            "name": "Attach (OpenOCD)",
+            "type": "cortex-debug",
+            "request": "attach",
+            "cwd": "${workspaceFolder}",
+            "executable": "${workspaceFolder}/build/Debug/pwm_snail.elf",
+            "servertype": "openocd",
+            "configFiles": ["${workspaceFolder}/openocd.cfg"],
+            "searchDir": ["${workspaceFolder}"],
+            "showDevDebugOutput": "raw"
+        }
+    ]
+}
