@@ -20,11 +20,16 @@ typedef enum {
 extern void fric_off(void);
 extern void fric_on(uint16_t cmd);   /* cmd: 0~100 占空比 */
 
+/* 新增：按 PWM 通道独立设置占空比，通道 1~3 对应 PWM5~PWM7 */
+extern void fric_set_channel_duty(uint8_t channel, uint8_t duty);
+extern uint8_t fric_get_channel_duty(uint8_t channel);
+
 /* 新增：EN 引脚与斜坡控制 */
 extern void fric_en_on(void);
 extern void fric_en_off(void);
 extern void fric_set_duty(uint8_t duty);   /* 立即设置占空比 0~100 */
 extern void fan_set_target(uint8_t target_duty);
+extern void fan_set_target_by_channel(uint8_t channel, uint8_t target_duty);
 extern void fan_stop(void);
 extern void fan_tick(void);   /* 在 while(1) 主循环里调用，50ms 一次 */
 extern uint8_t fan_get_current_duty(void);

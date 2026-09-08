@@ -7,6 +7,7 @@ extern TIM_HandleTypeDef htim8;
 static fan_state_t s_fan_state = FAN_STATE_IDLE;
 static uint8_t s_current_duty = 0;     /* 当前实际占空比 */
 static uint8_t s_target_duty  = 0;    /* 目标占空比 */
+static uint8_t s_channel_duty[3] = {0, 0, 0};
 static uint32_t s_last_tick   = 0;    /* 上次斜坡更新时间 */
 static uint32_t s_stop_timer  = 0;   /* 停机延时计时 */
 
@@ -14,13 +15,58 @@ static uint32_t s_stop_timer  = 0;   /* 停机延时计时 */
 #define RAMP_STEP        1     /* 步进 1%，0->100% 约 5s */
 #define STOP_DELAY_MS    200   /* PWM 归零后保持 200ms 再断 EN */
 
-/* 内部：同步写 TIM8_CH1~CH3 的 CCR (0~100)，对应 C板 PWM5~PWM7 */
+/* 内部：同步写 TIM8_CH1~CH3 的 CCR (0~100)，对应 C板 PWM5~PWM7。
+ * 物理连接约定：
+ *   - PWM5 -> 风机 1
+ *   - PWM6 -> 风机 2
+ *   - PWM7 -> 风机 3 与风机 4 共用，两个风机共用同一个占空比输出
+ */
 static void fric_apply_ccr(uint16_t cmd)
 {
     /* TIM8 Period=99，CCR 范围 0~100，三个输出保持相同占空比 */
-    __HAL_TIM_SetCompare(&htim8, TIM_CHANNEL_1, cmd);
-    __HAL_TIM_SetCompare(&htim8, TIM_CHANNEL_2, cmd);
-    __HAL_TIM_SetCompare(&htim8, TIM_CHANNEL_3, cmd);
+    s_channel_duty[0] = (uint8_t)cmd;
+    s_channel_duty[1] = (uint8_t)cmd;
+    s_channel_duty[2] = (uint8_t)cmd;
+    __HAL_TIM_SetCompare(&htim8, TIM_CHANNEL_1, cmd);  /* PWM5: fan1 */
+    __HAL_TIM_SetCompare(&htim8, TIM_CHANNEL_2, cmd);  /* PWM6: fan2 */
+    __HAL_TIM_SetCompare(&htim8, TIM_CHANNEL_3, cmd);  /* PWM7: fan3 + fan4 */
+}
+
+void fric_set_channel_duty(uint8_t channel, uint8_t duty)
+{
+    if (channel < 1U || channel > 3U)
+    {
+        return;
+    }
+    if (duty > FRIC_DUTY_MAX)
+    {
+        duty = FRIC_DUTY_MAX;
+    }
+    s_channel_duty[channel - 1U] = duty;
+
+    switch (channel)
+    {
+        case 1U:
+            __HAL_TIM_SetCompare(&htim8, TIM_CHANNEL_1, duty);
+            break;
+        case 2U:
+            __HAL_TIM_SetCompare(&htim8, TIM_CHANNEL_2, duty);
+            break;
+        case 3U:
+            __HAL_TIM_SetCompare(&htim8, TIM_CHANNEL_3, duty);
+            break;
+        default:
+            break;
+    }
+}
+
+uint8_t fric_get_channel_duty(uint8_t channel)
+{
+    if (channel < 1U || channel > 3U)
+    {
+        return 0U;
+    }
+    return s_channel_duty[channel - 1U];
 }
 
 /* 旧 API：关闭摩擦轮/风机（占空比 0） */
@@ -76,6 +122,22 @@ void fan_set_target(uint8_t target_duty)
     }
 }
 
+void fan_set_target_by_channel(uint8_t channel, uint8_t target_duty)
+{
+    if (channel < 1U || channel > 3U)
+    {
+        return;
+    }
+    if (target_duty > FRIC_DUTY_MAX)
+    {
+        target_duty = FRIC_DUTY_MAX;
+    }
+    fric_set_channel_duty(channel, target_duty);
+    if (channel == 1U)
+    {
+        s_target_duty = target_duty;
+    }
+}
 /* 请求停机：进入斜坡降速状态 */
 void fan_stop(void)
 {

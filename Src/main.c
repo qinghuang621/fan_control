@@ -30,6 +30,7 @@
 /* USER CODE BEGIN Includes */
 #include "bsp_fric.h"
 #include "bsp_led.h"
+#include "bsp_modbus.h"
 #include "bsp_pulse.h"
 
 /* USER CODE END Includes */
@@ -95,6 +96,7 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_DMA_Init();
+  MX_USART2_RS485_UART_Init();
   MX_USART3_UART_Init();
   MX_TIM8_Init();
   MX_TIM1_Init();
@@ -117,6 +119,9 @@ int main(void)
     /* 初始化板载 RGB LED（TIM5 + PH10/PH11/PH12），开启彩虹渐变+呼吸 */
     led_init();
 
+    /* 初始化 RS485 Modbus RTU 从站 */
+    modbus_init();
+
     /* 等 USB CDC 枚举完成（最多 1 秒） */
     HAL_Delay(1000);
 
@@ -131,6 +136,8 @@ int main(void)
     /* USER CODE BEGIN 3 */
         /* 风机状态机：斜坡调速 + 停机延时断电 */
         fan_tick();
+        /* RS485 Modbus RTU 从站轮询 */
+        modbus_poll();
         /* 白线测速：500ms 窗口计数（主循环节拍驱动） */
         pulse_poll();
         /* LED 彩虹渐变+亮度呼吸（每 5ms 一次效果最佳） */
