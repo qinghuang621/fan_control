@@ -11,7 +11,7 @@
 - 20 kHz 风机控制波形输出。
 - RS485 Modbus RTU 从站接口，供 EBS-P300 / ROS2 上位机访问。
 - USB CDC 调试输出，便于开发和现场排查。
-- 采用主循环驱动的简单状态机，当前还未完全移植 running 项目的 FreeRTOS 多任务框架。
+- 已完成 running 风格的 FreeRTOS 任务拆分，主控循环转为多任务调度：`FanTask`、`ModbusTask`、`PulseTask`、`LedTask` 分工处理风机状态机、Modbus 轮询、脉冲采样和状态指示。
 
 ## 2. 硬件连接
 
@@ -178,13 +178,13 @@ C 板本身不承担 ROS2 运行环境，而是作为 RS485 设备节点、Modbu
 - 四路 FG 输入捕获实现
 - 三路 PWM 输出同步实现
 - RS485 Modbus RTU 从站框架搭建
+- running 风格 FreeRTOS 任务拆分：`FanTask` / `ModbusTask` / `PulseTask` / `LedTask`
 - 参数区断电保持雏形实现
 - 目标寄存器映射与状态区结构整理
 
 仍待完成：
 
-- running 项目的完整 FreeRTOS 迁移
-- CAN 控制链路的完整对接
+- running 项目的完整 CAN 控制链路与运动学闭环对接
 - 实际硬件联调
 - ROS2 端最终节点和状态发布方案收口
 
@@ -211,5 +211,6 @@ cmake --build --preset Debug --parallel 4
 
 - 已完成设备层（硬件映射 + PWM + FG + RS485）
 - 已具备上位机可访问的 Modbus 接口
-- 尚未完成 running 体系中的完整 FreeRTOS / CAN 端到端迁移
+- 已完成 running 风格的 FreeRTOS 任务层接入，具备分任务调度能力
+- 尚未完成 running 体系中的完整 CAN / 运动学端到端闭环迁移
 - 下一阶段重点是 EBS-P300 / ROS2 上位机侧对接与真实板卡联调

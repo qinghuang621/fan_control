@@ -19,6 +19,8 @@
 /* USER CODE END Header */
 
 /* Includes ------------------------------------------------------------------*/
+#include "FreeRTOS.h"
+#include "task.h"
 #include "main.h"
 #include "dma.h"
 #include "tim.h"
@@ -58,6 +60,10 @@
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
+static void FanTask_Entry(void *argument);
+static void ModbusTask_Entry(void *argument);
+static void PulseTask_Entry(void *argument);
+static void LedTask_Entry(void *argument);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -65,7 +71,66 @@ void SystemClock_Config(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
+void vApplicationGetIdleTaskMemory(StaticTask_t **ppxIdleTaskTCBBuffer,
+                                   StackType_t **ppxIdleTaskStackBuffer,
+                                   uint32_t *pulIdleTaskStackSize)
+{
+    static StaticTask_t idleTaskTCB;
+    static StackType_t idleTaskStack[configMINIMAL_STACK_SIZE];
+
+    *ppxIdleTaskTCBBuffer = &idleTaskTCB;
+    *ppxIdleTaskStackBuffer = idleTaskStack;
+    *pulIdleTaskStackSize = configMINIMAL_STACK_SIZE;
+}
+
+void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName)
+{
+    (void)xTask;
+    (void)pcTaskName;
+    Error_Handler();
+}
+
 /* USER CODE END 0 */
+
+static void FanTask_Entry(void *argument)
+{
+   (void)argument;
+   for (;;)
+   {
+       fan_tick();
+       vTaskDelay(pdMS_TO_TICKS(5U));
+   }
+}
+
+static void ModbusTask_Entry(void *argument)
+{
+   (void)argument;
+   for (;;)
+   {
+       modbus_poll();
+       vTaskDelay(pdMS_TO_TICKS(5U));
+   }
+}
+
+static void PulseTask_Entry(void *argument)
+{
+   (void)argument;
+   for (;;)
+   {
+       pulse_poll();
+       vTaskDelay(pdMS_TO_TICKS(10U));
+   }
+}
+
+static void LedTask_Entry(void *argument)
+{
+   (void)argument;
+   for (;;)
+   {
+       led_tick();
+       vTaskDelay(pdMS_TO_TICKS(5U));
+   }
+}
 
 /**
   * @brief  The application entry point.
@@ -122,30 +187,31 @@ int main(void)
     /* 初始化 RS485 Modbus RTU 从站 */
     modbus_init();
 
-    /* 等 USB CDC 枚举完成（最多 1 秒） */
-    HAL_Delay(1000);
+    if (xTaskCreate(FanTask_Entry, "FanTask", 256U, NULL, tskIDLE_PRIORITY + 3U, NULL) != pdPASS)
+    {
+        Error_Handler();
+    }
+    if (xTaskCreate(ModbusTask_Entry, "ModbusTask", 256U, NULL, tskIDLE_PRIORITY + 4U, NULL) != pdPASS)
+    {
+        Error_Handler();
+    }
+    if (xTaskCreate(PulseTask_Entry, "PulseTask", 256U, NULL, tskIDLE_PRIORITY + 2U, NULL) != pdPASS)
+    {
+        Error_Handler();
+    }
+    if (xTaskCreate(LedTask_Entry, "LedTask", 256U, NULL, tskIDLE_PRIORITY + 1U, NULL) != pdPASS)
+    {
+        Error_Handler();
+    }
+
+    vTaskStartScheduler();
+
+    /* Should never reach here. */
+    for (;;)
+    {
+    }
 
   /* USER CODE END 2 */
-
-  /* Infinite loop */
-  /* USER CODE BEGIN WHILE */
-  while (1)
-  {
-    /* USER CODE END WHILE */
-
-    /* USER CODE BEGIN 3 */
-        /* 风机状态机：斜坡调速 + 停机延时断电 */
-        fan_tick();
-        /* RS485 Modbus RTU 从站轮询 */
-        modbus_poll();
-        /* 白线测速：500ms 窗口计数（主循环节拍驱动） */
-        pulse_poll();
-        /* LED 彩虹渐变+亮度呼吸（每 5ms 一次效果最佳） */
-        led_tick();
-        /* 5ms 主循环节拍（与 LED 步进同步） */
-        HAL_Delay(5);
-  }
-  /* USER CODE END 3 */
 }
 
 /**
