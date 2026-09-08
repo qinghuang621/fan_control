@@ -19,13 +19,32 @@
 #define FLASH_RETENTIVE_PARAM_COUNT 48U
 #define FLASH_RETENTIVE_BLOCK_SIZE 112U
 
-/* 参考 running 项目的 Modbus 地址规划：
- * 0x0000~0x003F : 控制/命令区（这里映射为风机占空比/状态控制）
- * 0x0040~0x008F : CAN 电机状态区（当前先保留，只读状态字段，后续可对齐 running 的电机状态映射）
- * 0x0090~0x00BF : 参数区（保留给 UART/站号/配置等断电保持参数）
+/* 参考 running 项目的 Modbus 地址规划；为避免与电机控制区冲突，风机占空比控制区被挪到 0x0100 以后。
+ * 0x0000~0x0019 : CAN 电机控制区（保持与 running 完全一致）
+ * 0x0040~0x008F : CAN 电机状态区（只读）
+ * 0x0090~0x00BF : 参数区
+ * 0x0100~0x0103 : 风机占空比控制区（四个风机）
  * 0x00C0~0x00FF : 保留区
  */
-#define REG_FAN_DUTY_BASE 0x0000U
+#define REG_MOTOR_EN_BASE 0x0000U
+#define REG_MOTOR_CLR_BASE 0x0004U
+#define REG_MOTOR_VEL_BASE 0x000AU
+#define REG_MOTOR_VY_HI 0x0014U
+#define REG_MOTOR_VX_HI 0x0016U
+#define REG_MOTOR_WZ_HI 0x0018U
+#define REG_MOTOR_CMD_COUNT 6U
+#define REG_MOTOR_STATUS_M1 0x0064U
+#define REG_MOTOR_STATUS_M2 0x006EU
+#define REG_MOTOR_STATUS_M3 0x0078U
+#define REG_MOTOR_STATUS_M4 0x0082U
+#define REG_MOTOR_STATUS_STRIDE 10U
+#define REG_MOTOR_TX_ID_BASE 0x201U
+#define REG_MOTOR_COUNT 4U
+#define REG_MOTOR_W_MAX 30.0f
+#define REG_MOTOR_LX 0.15f
+#define REG_MOTOR_LY 0.15f
+#define REG_MOTOR_R 0.05f
+#define REG_FAN_DUTY_BASE 0x0100U
 #define REG_FAN_CNT 4U
 #define REG_CAN_STATUS_BASE 0x0040U
 #define REG_CAN_STATUS_END 0x008FU
@@ -34,10 +53,6 @@
 #define REG_PARAM_END 0x00BFU
 #define REG_PARAM_UART_CFG 0x0090U
 #define REG_PARAM_SLAVE_ADDR 0x0091U
-#define REG_CAN_STATUS_M1 0x0064U
-#define REG_CAN_STATUS_M2 0x006EU
-#define REG_CAN_STATUS_M3 0x0078U
-#define REG_CAN_STATUS_M4 0x0082U
 
 static volatile uint8_t s_rx_ring[MODBUS_RX_RING_SIZE];
 static volatile uint16_t s_rx_head = 0U;
@@ -57,6 +72,8 @@ typedef struct
     uint32_t crc;
     uint16_t values[FLASH_RETENTIVE_PARAM_COUNT];
 } retentive_block_t;
+
+static void motor_can_poll_rx(void);
 
 static uint16_t crc16_update(uint16_t crc, uint8_t byte)
 {
@@ -200,10 +217,10 @@ static uint8_t get_modbus_slave_addr(void)
 static void refresh_fan_state_registers(void)
 {
     const uint16_t motor_status_base[REG_FAN_CNT] = {
-        REG_CAN_STATUS_M1,
-        REG_CAN_STATUS_M2,
-        REG_CAN_STATUS_M3,
-        REG_CAN_STATUS_M4
+        REG_MOTOR_STATUS_M1,
+        REG_MOTOR_STATUS_M2,
+        REG_MOTOR_STATUS_M3,
+        REG_MOTOR_STATUS_M4
     };
 
     for (uint16_t i = 0U; i < REG_FAN_CNT; ++i)
@@ -356,6 +373,229 @@ static void retentive_poll(void)
     retentive_commit_params();
 }
 
+static float read_float32_regs(const uint16_t *regs, uint16_t addr)
+{
+    union
+    {
+        float f;
+        uint32_t u32;
+    } conv;
+
+    conv.u32 = ((uint32_t)regs[(uint16_t)(addr + 1U)] << 16U) | regs[addr];
+    return conv.f;
+}
+
+static void write_float32_regs(uint16_t *regs, uint16_t addr, float value)
+{
+    union
+    {
+        float f;
+        uint32_t u32;
+    } conv;
+
+    conv.f = value;
+    regs[addr] = (uint16_t)(conv.u32 & 0xFFFFU);
+    regs[(uint16_t)(addr + 1U)] = (uint16_t)((conv.u32 >> 16U) & 0xFFFFU);
+}
+
+static void motor_kinematics_resolve(void)
+{
+    float vx = read_float32_regs(s_holding_regs, REG_MOTOR_VX_HI);
+    float vy = read_float32_regs(s_holding_regs, REG_MOTOR_VY_HI);
+    float wz = read_float32_regs(s_holding_regs, REG_MOTOR_WZ_HI);
+    float wheel[REG_MOTOR_COUNT] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float max_speed = 0.0f;
+
+    wheel[0] = ((vx - vy) + (REG_MOTOR_LX + REG_MOTOR_LY) * wz) / (REG_MOTOR_R * 2.0f);
+    wheel[1] = ((vx + vy) - (REG_MOTOR_LX + REG_MOTOR_LY) * wz) / (REG_MOTOR_R * 2.0f);
+    wheel[2] = ((vx + vy) + (REG_MOTOR_LX + REG_MOTOR_LY) * wz) / (REG_MOTOR_R * 2.0f);
+    wheel[3] = ((vx - vy) - (REG_MOTOR_LX + REG_MOTOR_LY) * wz) / (REG_MOTOR_R * 2.0f);
+
+    for (uint16_t i = 0U; i < REG_MOTOR_COUNT; ++i)
+    {
+        if (wheel[i] < 0.0f)
+        {
+            wheel[i] = -wheel[i];
+        }
+        if (wheel[i] > max_speed)
+        {
+            max_speed = wheel[i];
+        }
+    }
+
+    if (max_speed > REG_MOTOR_W_MAX)
+    {
+        float scale = REG_MOTOR_W_MAX / max_speed;
+        for (uint16_t i = 0U; i < REG_MOTOR_COUNT; ++i)
+        {
+            wheel[i] *= scale;
+        }
+    }
+
+    for (uint16_t i = 0U; i < REG_MOTOR_COUNT; ++i)
+    {
+        write_float32_regs(s_holding_regs, (uint16_t)(REG_MOTOR_VEL_BASE + i * 2U), wheel[i]);
+    }
+}
+
+static void MX_CAN1_Init(void)
+{
+    __HAL_RCC_CAN1_CLK_ENABLE();
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+
+    GPIO_InitTypeDef gpio_init = {0};
+    gpio_init.Pin = GPIO_PIN_11 | GPIO_PIN_12;
+    gpio_init.Mode = GPIO_MODE_AF_PP;
+    gpio_init.Pull = GPIO_NOPULL;
+    gpio_init.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+    gpio_init.Alternate = GPIO_AF9_CAN1;
+    HAL_GPIO_Init(GPIOA, &gpio_init);
+
+    CAN1->MCR |= CAN_MCR_INRQ;
+    while ((CAN1->MSR & CAN_MSR_INAK) == 0U)
+    {
+    }
+
+    CAN1->MCR |= CAN_MCR_ABOM | CAN_MCR_AWUM | CAN_MCR_TXFP;
+    CAN1->BTR = (uint32_t)((0U << 30U) |
+                           (3U << 16U) |
+                           (13U << 8U) |
+                           (2U << 4U) |
+                           0U);
+
+    CAN1->FMR |= CAN_FMR_FINIT;
+    CAN1->FA1R = 0U;
+    CAN1->FM1R = 0U;
+    CAN1->FS1R = 0x00000001U;
+    CAN1->FFA1R = 0U;
+    CAN1->sFilterRegister[0].FR1 = 0x00000000U;
+    CAN1->sFilterRegister[0].FR2 = 0x00000000U;
+    CAN1->FA1R |= 1U;
+    CAN1->FMR &= ~CAN_FMR_FINIT;
+
+    CAN1->MCR &= ~CAN_MCR_INRQ;
+    while ((CAN1->MSR & CAN_MSR_INAK) != 0U)
+    {
+    }
+}
+
+static uint8_t motor_can_send_frame(uint32_t std_id, const uint8_t *data, uint8_t len)
+{
+    uint8_t mailbox = 0U;
+
+    if (len > 8U)
+    {
+        return 0U;
+    }
+
+    while (((CAN1->TSR & CAN_TSR_TME0) == 0U) && ((CAN1->TSR & CAN_TSR_TME1) == 0U) && ((CAN1->TSR & CAN_TSR_TME2) == 0U))
+    {
+    }
+
+    if ((CAN1->TSR & CAN_TSR_TME0) != 0U)
+    {
+        mailbox = 0U;
+    }
+    else if ((CAN1->TSR & CAN_TSR_TME1) != 0U)
+    {
+        mailbox = 1U;
+    }
+    else
+    {
+        mailbox = 2U;
+    }
+
+    CAN1->sTxMailBox[mailbox].TIR = ((std_id & 0x7FFU) << 21U) | CAN_TI0R_TXRQ;
+    CAN1->sTxMailBox[mailbox].TDTR = len;
+    CAN1->sTxMailBox[mailbox].TDLR = (uint32_t)data[0] | ((uint32_t)data[1] << 8U) | ((uint32_t)data[2] << 16U) | ((uint32_t)data[3] << 24U);
+    CAN1->sTxMailBox[mailbox].TDHR = (uint32_t)data[4] | ((uint32_t)data[5] << 8U) | ((uint32_t)data[6] << 16U) | ((uint32_t)data[7] << 24U);
+    return 1U;
+}
+
+static void motor_can_send_speed(uint16_t motor_index, float speed)
+{
+    uint8_t payload[8] = {0};
+    union
+    {
+        float f;
+        uint32_t u32;
+    } conv;
+
+    conv.f = speed;
+    payload[0] = (uint8_t)(conv.u32 & 0xFFU);
+    payload[1] = (uint8_t)((conv.u32 >> 8U) & 0xFFU);
+    payload[2] = (uint8_t)((conv.u32 >> 16U) & 0xFFU);
+    payload[3] = (uint8_t)((conv.u32 >> 24U) & 0xFFU);
+    payload[4] = 0U;
+    payload[5] = 0U;
+    payload[6] = 0U;
+    payload[7] = 0U;
+    motor_can_send_frame((uint32_t)(0x201U + motor_index), payload, 8U);
+}
+
+static void motor_can_tick(void)
+{
+    static uint32_t last_tick_ms = 0U;
+    if ((HAL_GetTick() - last_tick_ms) < 10U)
+    {
+        return;
+    }
+    last_tick_ms = HAL_GetTick();
+
+    for (uint16_t i = 0U; i < REG_MOTOR_COUNT; ++i)
+    {
+        uint16_t enable_addr = (uint16_t)(REG_MOTOR_EN_BASE + i);
+        uint16_t clear_addr = (uint16_t)(REG_MOTOR_CLR_BASE + i);
+        float speed = read_float32_regs(s_holding_regs, (uint16_t)(REG_MOTOR_VEL_BASE + i * 2U));
+
+        if (s_holding_regs[enable_addr] != 0U)
+        {
+            uint8_t payload[8] = {0U};
+            payload[0] = (uint8_t)i;
+            payload[1] = 0x01U;
+            motor_can_send_frame((uint32_t)(0x200U + i + 1U), payload, 8U);
+        }
+
+        if (s_holding_regs[clear_addr] != 0U)
+        {
+            uint8_t payload[8] = {0U};
+            payload[0] = (uint8_t)i;
+            payload[1] = 0x02U;
+            motor_can_send_frame((uint32_t)(0x200U + i + 1U), payload, 8U);
+            s_holding_regs[clear_addr] = 0U;
+        }
+
+        motor_can_send_speed(i, speed);
+    }
+}
+
+static void motor_status_update_from_can(uint32_t std_id, const uint8_t *data)
+{
+    if (std_id < 0x201U || std_id > 0x204U)
+    {
+        return;
+    }
+
+    uint16_t motor_index = (uint16_t)(std_id - 0x201U);
+    uint16_t status_base = (uint16_t)(REG_MOTOR_STATUS_M1 + motor_index * REG_MOTOR_STATUS_STRIDE);
+    union
+    {
+        float f;
+        uint32_t u32;
+    } conv;
+
+    if (data[0] != 0U)
+    {
+        s_holding_regs[status_base + 0U] = (uint16_t)data[0];
+    }
+    s_holding_regs[status_base + 1U] = 0U;
+
+    conv.u32 = (uint32_t)data[4U] << 24U | (uint32_t)data[5U] << 16U | (uint32_t)data[6U] << 8U | (uint32_t)data[7U];
+    write_float32_regs(s_holding_regs, status_base + 2U, conv.f);
+    conv.u32 = (uint32_t)data[0U] << 24U | (uint32_t)data[1U] << 16U | (uint32_t)data[2U] << 8U | (uint32_t)data[3U];
+    write_float32_regs(s_holding_regs, status_base + 4U, conv.f);
+}
+
 static void modbus_write_single_register(uint16_t addr, uint16_t value)
 {
     if (addr >= MODBUS_REG_COUNT)
@@ -365,6 +605,16 @@ static void modbus_write_single_register(uint16_t addr, uint16_t value)
 
     if (is_can_status_region(addr))
     {
+        return;
+    }
+
+    if ((addr >= REG_MOTOR_EN_BASE) && (addr <= (REG_MOTOR_WZ_HI + 1U)))
+    {
+        s_holding_regs[addr] = value;
+        if ((addr >= REG_MOTOR_VY_HI) && (addr <= REG_MOTOR_WZ_HI))
+        {
+            motor_kinematics_resolve();
+        }
         return;
     }
 
@@ -500,6 +750,7 @@ void modbus_init(void)
     s_holding_regs[REG_FAN_DUTY_BASE + 2U] = 0U;
     s_holding_regs[REG_FAN_DUTY_BASE + 3U] = 0U;
 
+    MX_CAN1_Init();
     retentive_load_params();
     refresh_fan_state_registers();
 
@@ -515,6 +766,8 @@ void modbus_poll(void)
     static uint16_t frame_len = 0U;
 
     retentive_poll();
+    motor_can_poll_rx();
+    motor_can_tick();
 
     while (ring_len() > 0U)
     {
@@ -566,6 +819,33 @@ void modbus_poll(void)
                 }
             }
         }
+    }
+}
+
+static void motor_can_poll_rx(void)
+{
+    while ((CAN1->RF0R & CAN_RF0R_FMP0) != 0U)
+    {
+        uint32_t rir = CAN1->sFIFOMailBox[0].RIR;
+        uint32_t std_id = (rir >> 21U) & 0x7FFU;
+        uint8_t dlc = (uint8_t)(CAN1->sFIFOMailBox[0].RDTR & 0x0FU);
+        uint8_t rx_data[8] = {0};
+
+        rx_data[0] = (uint8_t)(CAN1->sFIFOMailBox[0].RDLR & 0xFFU);
+        rx_data[1] = (uint8_t)((CAN1->sFIFOMailBox[0].RDLR >> 8U) & 0xFFU);
+        rx_data[2] = (uint8_t)((CAN1->sFIFOMailBox[0].RDLR >> 16U) & 0xFFU);
+        rx_data[3] = (uint8_t)((CAN1->sFIFOMailBox[0].RDLR >> 24U) & 0xFFU);
+        rx_data[4] = (uint8_t)(CAN1->sFIFOMailBox[0].RDHR & 0xFFU);
+        rx_data[5] = (uint8_t)((CAN1->sFIFOMailBox[0].RDHR >> 8U) & 0xFFU);
+        rx_data[6] = (uint8_t)((CAN1->sFIFOMailBox[0].RDHR >> 16U) & 0xFFU);
+        rx_data[7] = (uint8_t)((CAN1->sFIFOMailBox[0].RDHR >> 24U) & 0xFFU);
+
+        if (dlc > 8U)
+        {
+            dlc = 8U;
+        }
+        motor_status_update_from_can(std_id, rx_data);
+        CAN1->RF0R |= CAN_RF0R_RFOM0;
     }
 }
 
