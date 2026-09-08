@@ -25,7 +25,6 @@
 #include "dma.h"
 #include "tim.h"
 #include "usart.h"
-#include "usb_device.h"
 #include "gpio.h"
 
 /* Private includes ----------------------------------------------------------*/
@@ -175,7 +174,7 @@ int main(void)
   MX_USART3_UART_Init();
   MX_TIM8_Init();
   MX_TIM1_Init();
-  MX_USB_DEVICE_Init();
+  /* USB CDC 已废弃：CAN1 占用 PD0/PD1，且不再使用虚拟串口调试 */
   /* USER CODE BEGIN 2 */
 
     /* 启动 TIM8 CH1~CH3 PWM 输出（C板 PWM5~PWM7，20kHz） */

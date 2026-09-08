@@ -497,28 +497,44 @@ static void motor_kinematics_resolve(void)
 
 static void MX_CAN1_Init(void)
 {
+    /* CAN1 引脚：PD0 = CAN1_RX，PD1 = CAN1_TX（AF9），依据 RoboMaster C 板用户手册。
+     * 注意：早期版本误配为 PA11/PA12（那是 USB_OTG_FS 的 D-/D+），已修正。
+     * PD0/PD1 在本工程无其它用途。 */
     __HAL_RCC_CAN1_CLK_ENABLE();
-    __HAL_RCC_GPIOA_CLK_ENABLE();
+    __HAL_RCC_GPIOD_CLK_ENABLE();
 
     GPIO_InitTypeDef gpio_init = {0};
-    gpio_init.Pin = GPIO_PIN_11 | GPIO_PIN_12;
+    gpio_init.Pin = GPIO_PIN_0 | GPIO_PIN_1;
     gpio_init.Mode = GPIO_MODE_AF_PP;
+    /* 达妙电机侧的收发器/终端电阻一般自带偏置，此处用 NOPULL 避免与总线既有上下拉打架 */
     gpio_init.Pull = GPIO_NOPULL;
     gpio_init.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
     gpio_init.Alternate = GPIO_AF9_CAN1;
-    HAL_GPIO_Init(GPIOA, &gpio_init);
+    HAL_GPIO_Init(GPIOD, &gpio_init);
 
     CAN1->MCR |= CAN_MCR_INRQ;
     while ((CAN1->MSR & CAN_MSR_INAK) == 0U)
     {
     }
 
-    CAN1->MCR |= CAN_MCR_ABOM | CAN_MCR_AWUM | CAN_MCR_TXFP;
-    CAN1->BTR = (uint32_t)((0U << 30U) |
-                           (3U << 16U) |
-                           (13U << 8U) |
-                           (2U << 4U) |
-                           0U);
+    /* NART = 1：禁止自动重传。总线上无节点应答时，控制器会一直重发并占满三个发送邮箱，
+     * 叠加 motor_can_send_frame() 的 while 死等会把 ModbusTask 挂死。置 NART 后发送失败即丢弃。 */
+    CAN1->MCR |= CAN_MCR_ABOM | CAN_MCR_AWUM | CAN_MCR_TXFP | CAN_MCR_NART;
+
+    /* 位时间配置，PCLK1 = 42MHz，目标 1Mbps，与 running (PSC=3 / BS1=11TQ / BS2=2TQ / SJW=1TQ) 一致：
+     *   SJW[25:24] = 0   -> 1TQ
+     *   TS2 [22:20] = 1  -> 2TQ
+     *   TS1 [19:16] = 10 -> 11TQ
+     *   BRP [9:0]   = 2  -> 分频 3
+     * 位时间 = 1 + 11 + 2 = 14 TQ  ->  42MHz / (3 * 14) = 1.000 Mbps，采样点 85.7%
+     * 合值 0x001A0002。
+     *
+     * 修正前为 (3<<16)|(13<<8)|(2<<4)，13 落入保留位、2 把 BRP 撑成 289，
+     * 实际波特率仅 42MHz/(289*6) ≈ 24.2 kbps，达妙电机不会响应。 */
+    CAN1->BTR = (uint32_t)((0U << 24U) |    /* SJW  = 0  -> 1TQ  */
+                           (1U << 20U) |    /* TS2  = 1  -> 2TQ  */
+                           (10U << 16U) |   /* TS1  = 10 -> 11TQ */
+                           2U);             /* BRP  = 2  -> PSC=3 */
 
     CAN1->FMR |= CAN_FMR_FINIT;
     CAN1->FA1R = 0U;
