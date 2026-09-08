@@ -399,46 +399,100 @@ static void write_float32_regs(uint16_t *regs, uint16_t addr, float value)
     regs[(uint16_t)(addr + 1U)] = (uint16_t)(conv.u32 & 0xFFFFU);
 }
 
-static void motor_kinematics_resolve(void)
-{
-    float vy = read_float32_regs(s_holding_regs, 0x0014U);
-    float vx = read_float32_regs(s_holding_regs, 0x0016U);
-    float wz = read_float32_regs(s_holding_regs, 0x0018U);
-    float half_ly = 0.15f / 2.0f;
-    float half_lx = 0.15f / 2.0f;
-    float inv_r = 1.0f / 0.05f;
-    float w_lf = (vx + half_ly * wz) * inv_r;
-    float w_rf = (vy + half_lx * wz) * inv_r;
-    float w_rr = -(vx - half_ly * wz) * inv_r;
-    float w_lr = -(vy - half_lx * wz) * inv_r;
-    float vals[REG_MOTOR_COUNT] = {w_lf, w_rf, w_rr, w_lr};
-    float max_val = 0.0f;
+/* ===== 运动学：与 running 项目 Core/Src/kinematics.c 保持一致 =====
+ *
+ * 底盘构型：4 个正交全向轮
+ *   LF(电机1) / RR(电机3) = X 轮，只吃 vx
+ *   RF(电机2) / LR(电机4) = Y 轮，只吃 vy
+ * 因此每个轮速只依赖 vx 或 vy 之一是**正确**的，不要按麦克纳姆模型去改。
+ *
+ * 调用时机：与 running 的 CanTask 一致 —— 每 10ms 发速度命令前调用一次，
+ * 而不是上位机写寄存器时立即触发。这样 vx/vy/wz 必然来自同一时刻的快照，
+ * 不会用到"半新半旧"的值。
+ */
+#define KIN_LINK_TIMEOUT_MS 500U
 
+static volatile uint32_t s_kin_last_cmd_ms   = 0U;
+static volatile uint8_t  s_kin_ever_received = 0U;
+
+/* NaN / Inf 视为 0，避免污染电机命令（对应 running 的 prvSafe/isfinite） */
+static float kin_safe(float v)
+{
+    if (v != v)          { return 0.0f; }
+    if (v >  1.0e30f)    { return 0.0f; }
+    if (v < -1.0e30f)    { return 0.0f; }
+    return v;
+}
+
+static void motor_kinematics_feed_heartbeat(void)
+{
+    s_kin_last_cmd_ms   = HAL_GetTick();
+    s_kin_ever_received = 1U;
+}
+
+static void motor_kinematics_zero_outputs(void)
+{
     for (uint16_t i = 0U; i < REG_MOTOR_COUNT; ++i)
     {
-        if (vals[i] < 0.0f)
-        {
-            vals[i] = -vals[i];
-        }
-        if (vals[i] > max_val)
-        {
-            max_val = vals[i];
-        }
+        write_float32_regs(s_holding_regs, (uint16_t)(REG_MOTOR_VEL_BASE + i * 2U), 0.0f);
+    }
+}
+
+static void motor_kinematics_resolve(void)
+{
+    /* 1. 通信丢失保护（对应 running Kinematics_Resolve 的第 1 步）：
+     *    从未收到上位机命令，或超过 KIN_LINK_TIMEOUT_MS 没新命令 -> 四轮强制 0 */
+    if ((!s_kin_ever_received) ||
+        ((uint32_t)(HAL_GetTick() - s_kin_last_cmd_ms) > KIN_LINK_TIMEOUT_MS))
+    {
+        motor_kinematics_zero_outputs();
+        return;
     }
 
-    if (max_val > REG_MOTOR_W_MAX)
+    /* 2. 读车体速度命令（大端 float，与 running 一致） */
+    float vy = kin_safe(read_float32_regs(s_holding_regs, REG_MOTOR_VY_HI));
+    float vx = kin_safe(read_float32_regs(s_holding_regs, REG_MOTOR_VX_HI));
+    float wz = kin_safe(read_float32_regs(s_holding_regs, REG_MOTOR_WZ_HI));
+
+    /* 3. 正交全向轮逆运动学 —— 与 running kinematics.c 逐行一致
+     *    half_ly = half_lx = 0.075, inv_r = 20（KIN_LX/LY=0.15, KIN_R=0.05） */
+    float half_ly = REG_MOTOR_LY / 2.0f;
+    float half_lx = REG_MOTOR_LX / 2.0f;
+    float inv_r   = 1.0f / REG_MOTOR_R;
+
+    float w_lf =  (vx + half_ly * wz) * inv_r;
+    float w_rf =  (vy + half_lx * wz) * inv_r;
+    float w_rr = -(vx - half_ly * wz) * inv_r;
+    float w_lr = -(vy - half_lx * wz) * inv_r;
+
+    float vals[REG_MOTOR_COUNT] = {w_lf, w_rf, w_rr, w_lr};
+
+    /* 4. 等比例限幅（对应 running 的 prvScaleAll）
+     *    注意：取绝对值只用于求比例系数，绝不能写回 vals，否则负数轮速会被
+     *    吃掉符号，电机永远不会反转。 */
+    float max_abs = 0.0f;
+    for (uint16_t i = 0U; i < REG_MOTOR_COUNT; ++i)
     {
-        float scale = REG_MOTOR_W_MAX / max_val;
+        float a = (vals[i] < 0.0f) ? -vals[i] : vals[i];
+        if (a > max_abs)
+        {
+            max_abs = a;
+        }
+    }
+    if (max_abs > REG_MOTOR_W_MAX)
+    {
+        float scale = REG_MOTOR_W_MAX / max_abs;
         for (uint16_t i = 0U; i < REG_MOTOR_COUNT; ++i)
         {
             vals[i] *= scale;
         }
     }
 
-    write_float32_regs(s_holding_regs, 0x000AU, vals[0]);
-    write_float32_regs(s_holding_regs, 0x000CU, vals[1]);
-    write_float32_regs(s_holding_regs, 0x000EU, vals[2]);
-    write_float32_regs(s_holding_regs, 0x0010U, vals[3]);
+    /* 5. 写回 0x000A~0x0011：LF / RF / RR / LR 顺时针顺序 */
+    for (uint16_t i = 0U; i < REG_MOTOR_COUNT; ++i)
+    {
+        write_float32_regs(s_holding_regs, (uint16_t)(REG_MOTOR_VEL_BASE + i * 2U), vals[i]);
+    }
 }
 
 static void MX_CAN1_Init(void)
@@ -545,6 +599,9 @@ static void motor_can_tick(void)
     }
     last_tick_ms = HAL_GetTick();
 
+    /* 与 running CanTask 一致：发速度命令前先做运动学解算 */
+    motor_kinematics_resolve();
+
     for (uint16_t i = 0U; i < REG_MOTOR_COUNT; ++i)
     {
         uint16_t enable_addr = (uint16_t)(REG_MOTOR_EN_BASE + i);
@@ -614,9 +671,13 @@ static void modbus_write_single_register(uint16_t addr, uint16_t value)
     if ((addr >= REG_MOTOR_EN_BASE) && (addr <= (REG_MOTOR_WZ_HI + 1U)))
     {
         s_holding_regs[addr] = value;
-        if ((addr >= REG_MOTOR_VY_HI) && (addr <= REG_MOTOR_WZ_HI))
+        /* 写 0x0014~0x0019（vy/vx/wz）只更新通信心跳，不在这里解算。
+         * 解算统一放在 motor_can_tick() 每 10ms 一次，与 running 的 CanTask 一致，
+         * 保证 3 个 float 来自同一时刻快照；同时覆盖到 0x0019（wz 低字），
+         * 旧实现的上限是 0x0018，写低字不会触发解算，wz 会用到半新半旧的值。 */
+        if ((addr >= REG_MOTOR_VY_HI) && (addr <= (REG_MOTOR_WZ_HI + 1U)))
         {
-            motor_kinematics_resolve();
+            motor_kinematics_feed_heartbeat();
         }
         return;
     }
