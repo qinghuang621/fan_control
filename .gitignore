@@ -22,3 +22,6 @@ __pycache__/
 # Local secrets and environment files
 .env
 .env.*
+
+# WorkBuddy agent workspace (project memory, not part of firmware)
+.workbuddy/
