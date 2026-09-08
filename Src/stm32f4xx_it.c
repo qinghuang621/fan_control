@@ -23,6 +23,8 @@
 #include "stm32f4xx_it.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "FreeRTOS.h"
+#include "task.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -60,7 +62,10 @@ extern PCD_HandleTypeDef hpcd_USB_OTG_FS;
 extern DMA_HandleTypeDef hdma_usart3_rx;
 extern UART_HandleTypeDef huart2;
 /* USER CODE BEGIN EV */
-
+/* HAL 时基由 TIM6 提供（见 Src/stm32f4xx_hal_timebase_tim.c），SysTick 交给 FreeRTOS */
+extern TIM_HandleTypeDef htim6;
+/* FreeRTOS 节拍入口，由 port.c 提供 */
+extern void xPortSysTickHandler(void);
 /* USER CODE END EV */
 
 /******************************************************************************/
@@ -160,7 +165,16 @@ void SysTick_Handler(void)
   /* USER CODE BEGIN SysTick_IRQn 0 */
 
   /* USER CODE END SysTick_IRQn 0 */
-  HAL_IncTick();
+
+  /* 清除 SysTick 溢出标志（读 CTRL 即可），然后交给 FreeRTOS 节拍处理。
+   * 调度器未启动时不能调用 xPortSysTickHandler，否则会在启动阶段触发上下文切换。 */
+  SysTick->CTRL;
+
+  if (xTaskGetSchedulerState() != taskSCHEDULER_NOT_STARTED)
+  {
+      xPortSysTickHandler();
+  }
+
   /* USER CODE BEGIN SysTick_IRQn 1 */
 
   /* USER CODE END SysTick_IRQn 1 */
@@ -214,6 +228,12 @@ void TIM1_CC_IRQHandler(void)
 void USART2_IRQHandler(void)
 {
     HAL_UART_IRQHandler(&huart2);
+}
+
+/* TIM6 更新中断：HAL 1ms 时基（替代 SysTick） */
+void TIM6_DAC_IRQHandler(void)
+{
+    HAL_TIM_IRQHandler(&htim6);
 }
 
 /* USER CODE END 1 */

@@ -90,6 +90,16 @@ void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName)
     Error_Handler();
 }
 
+/* TIM6 每 1ms 触发一次更新中断，这里给 HAL 的 uwTick 计数（HAL_Delay/超时用）。
+ * SysTick 已交给 FreeRTOS，不再承担 HAL 时基。 */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+    if (htim->Instance == TIM6)
+    {
+        HAL_IncTick();
+    }
+}
+
 /* USER CODE END 0 */
 
 static void FanTask_Entry(void *argument)
