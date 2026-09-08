@@ -190,8 +190,8 @@ static void write_float32_le(uint16_t *regs, uint16_t addr, float value)
     } conv;
 
     conv.f = value;
-    regs[addr] = (uint16_t)(conv.u32 & 0xFFFFU);
-    regs[(uint16_t)(addr + 1U)] = (uint16_t)((conv.u32 >> 16U) & 0xFFFFU);
+    regs[addr] = (uint16_t)((conv.u32 >> 16U) & 0xFFFFU);
+    regs[(uint16_t)(addr + 1U)] = (uint16_t)(conv.u32 & 0xFFFFU);
 }
 
 static uint8_t is_can_status_region(uint16_t addr)
@@ -381,7 +381,7 @@ static float read_float32_regs(const uint16_t *regs, uint16_t addr)
         uint32_t u32;
     } conv;
 
-    conv.u32 = ((uint32_t)regs[(uint16_t)(addr + 1U)] << 16U) | regs[addr];
+    conv.u32 = ((uint32_t)regs[addr] << 16U) | regs[(uint16_t)(addr + 1U)];
     return conv.f;
 }
 
@@ -394,48 +394,50 @@ static void write_float32_regs(uint16_t *regs, uint16_t addr, float value)
     } conv;
 
     conv.f = value;
-    regs[addr] = (uint16_t)(conv.u32 & 0xFFFFU);
-    regs[(uint16_t)(addr + 1U)] = (uint16_t)((conv.u32 >> 16U) & 0xFFFFU);
+    regs[addr] = (uint16_t)((conv.u32 >> 16U) & 0xFFFFU);
+    regs[(uint16_t)(addr + 1U)] = (uint16_t)(conv.u32 & 0xFFFFU);
 }
 
 static void motor_kinematics_resolve(void)
 {
-    float vx = read_float32_regs(s_holding_regs, REG_MOTOR_VX_HI);
-    float vy = read_float32_regs(s_holding_regs, REG_MOTOR_VY_HI);
-    float wz = read_float32_regs(s_holding_regs, REG_MOTOR_WZ_HI);
-    float wheel[REG_MOTOR_COUNT] = {0.0f, 0.0f, 0.0f, 0.0f};
-    float max_speed = 0.0f;
-
-    wheel[0] = ((vx - vy) + (REG_MOTOR_LX + REG_MOTOR_LY) * wz) / (REG_MOTOR_R * 2.0f);
-    wheel[1] = ((vx + vy) - (REG_MOTOR_LX + REG_MOTOR_LY) * wz) / (REG_MOTOR_R * 2.0f);
-    wheel[2] = ((vx + vy) + (REG_MOTOR_LX + REG_MOTOR_LY) * wz) / (REG_MOTOR_R * 2.0f);
-    wheel[3] = ((vx - vy) - (REG_MOTOR_LX + REG_MOTOR_LY) * wz) / (REG_MOTOR_R * 2.0f);
+    float vy = read_float32_regs(s_holding_regs, 0x0014U);
+    float vx = read_float32_regs(s_holding_regs, 0x0016U);
+    float wz = read_float32_regs(s_holding_regs, 0x0018U);
+    float half_ly = 0.15f / 2.0f;
+    float half_lx = 0.15f / 2.0f;
+    float inv_r = 1.0f / 0.05f;
+    float w_lf = (vx + half_ly * wz) * inv_r;
+    float w_rf = (vy + half_lx * wz) * inv_r;
+    float w_rr = -(vx - half_ly * wz) * inv_r;
+    float w_lr = -(vy - half_lx * wz) * inv_r;
+    float vals[REG_MOTOR_COUNT] = {w_lf, w_rf, w_rr, w_lr};
+    float max_val = 0.0f;
 
     for (uint16_t i = 0U; i < REG_MOTOR_COUNT; ++i)
     {
-        if (wheel[i] < 0.0f)
+        if (vals[i] < 0.0f)
         {
-            wheel[i] = -wheel[i];
+            vals[i] = -vals[i];
         }
-        if (wheel[i] > max_speed)
+        if (vals[i] > max_val)
         {
-            max_speed = wheel[i];
+            max_val = vals[i];
         }
     }
 
-    if (max_speed > REG_MOTOR_W_MAX)
+    if (max_val > REG_MOTOR_W_MAX)
     {
-        float scale = REG_MOTOR_W_MAX / max_speed;
+        float scale = REG_MOTOR_W_MAX / max_val;
         for (uint16_t i = 0U; i < REG_MOTOR_COUNT; ++i)
         {
-            wheel[i] *= scale;
+            vals[i] *= scale;
         }
     }
 
-    for (uint16_t i = 0U; i < REG_MOTOR_COUNT; ++i)
-    {
-        write_float32_regs(s_holding_regs, (uint16_t)(REG_MOTOR_VEL_BASE + i * 2U), wheel[i]);
-    }
+    write_float32_regs(s_holding_regs, 0x000AU, vals[0]);
+    write_float32_regs(s_holding_regs, 0x000CU, vals[1]);
+    write_float32_regs(s_holding_regs, 0x000EU, vals[2]);
+    write_float32_regs(s_holding_regs, 0x0010U, vals[3]);
 }
 
 static void MX_CAN1_Init(void)
