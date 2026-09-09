@@ -6,6 +6,10 @@
 #include "bsp_fric.h"
 #include "bsp_pulse.h"
 
+/* CAN 发送等待邮箱时需要 vTaskDelay() 让出 CPU，见 motor_can_send_frame() */
+#include "FreeRTOS.h"
+#include "task.h"
+
 #include <string.h>
 
 #define MODBUS_SLAVE_ADDR 0x01U
@@ -45,6 +49,9 @@
 #define REG_MOTOR_LX 0.15f
 #define REG_MOTOR_LY 0.15f
 #define REG_MOTOR_R 0.05f
+/* 发送邮箱满时的等待上限（tick）。configTICK_RATE_HZ = 1000，即 5ms，
+ * 与 running CanTask_Send() 中 "osDelay(1) 最多 5 次" 一致 */
+#define MOTOR_CAN_TX_WAIT_TICKS 5U
 #define REG_FAN_DUTY_BASE 0x0100U
 #define REG_FAN_CNT 4U
 #define REG_CAN_STATUS_BASE 0x0040U
@@ -517,9 +524,16 @@ static void MX_CAN1_Init(void)
     {
     }
 
-    /* NART = 1：禁止自动重传。总线上无节点应答时，控制器会一直重发并占满三个发送邮箱，
-     * 叠加 motor_can_send_frame() 的 while 死等会把 ModbusTask 挂死。置 NART 后发送失败即丢弃。 */
-    CAN1->MCR |= CAN_MCR_ABOM | CAN_MCR_AWUM | CAN_MCR_TXFP | CAN_MCR_NART;
+    /* 与 running (hcan1.Init.AutoRetransmission = ENABLE) 对齐：保持自动重传开启，
+     * 总线上的偶发错误帧能自动补发，不会丢关键命令。
+     *
+     * 自动重传的代价是"总线上无节点应答时硬件会无限重传并占满三个发送邮箱"，
+     * 这个风险由 motor_can_send_frame() 负责兜底：邮箱满时先短暂等待（vTaskDelay
+     * 让出 CPU），仍满就中止三个 pending 邮箱，保证当前关键帧能发出去。
+     *
+     * 注：此前曾开启 CAN_MCR_NART（禁止自动重传）来缓解邮箱占满，但那样会丢掉
+     * 偶发错误的帧，且与 running 语义不一致，故改回自动重传 + 超时中止的方案。 */
+    CAN1->MCR |= CAN_MCR_ABOM | CAN_MCR_AWUM | CAN_MCR_TXFP;
 
     /* 位时间配置，PCLK1 = 42MHz，目标 1Mbps，与 running (PSC=3 / BS1=11TQ / BS2=2TQ / SJW=1TQ) 一致：
      *   SJW[25:24] = 0   -> 1TQ
@@ -552,30 +566,67 @@ static void MX_CAN1_Init(void)
     }
 }
 
+/* 取空闲发送邮箱号：0/1/2 = 可用邮箱，3 = 三个邮箱都忙 */
+static uint8_t motor_can_free_mailbox(void)
+{
+    if ((CAN1->TSR & CAN_TSR_TME0) != 0U)
+    {
+        return 0U;
+    }
+    if ((CAN1->TSR & CAN_TSR_TME1) != 0U)
+    {
+        return 1U;
+    }
+    if ((CAN1->TSR & CAN_TSR_TME2) != 0U)
+    {
+        return 2U;
+    }
+    return 3U;
+}
+
 static uint8_t motor_can_send_frame(uint32_t std_id, const uint8_t *data, uint8_t len)
 {
-    uint8_t mailbox = 0U;
+    uint8_t mailbox = motor_can_free_mailbox();
+    uint8_t wait = 0U;
 
     if (len > 8U)
     {
         return 0U;
     }
 
-    while (((CAN1->TSR & CAN_TSR_TME0) == 0U) && ((CAN1->TSR & CAN_TSR_TME1) == 0U) && ((CAN1->TSR & CAN_TSR_TME2) == 0U))
+    /* 与 running 的 CanTask_Send() 对齐（Core/Src/freertos.c:288）：
+     * 保持自动重传开启（NART=0）后，总线上没有节点应答时硬件会无限重传并占满三个
+     * 发送邮箱，因此邮箱满时必须能逃生。三步：
+     *
+     *   1) 先等待几个 tick，且用 vTaskDelay() 让出 CPU。
+     *      原实现是 while 空转死等，而本函数运行在最高优先级的 ModbusTask 里，
+     *      空转会把它下面三个任务（Fan/Pulse/Led）全部饿死，RS485 也跟着不回应。
+     *   2) 等待超时后中止三个 pending 邮箱，等价 HAL_CAN_AbortTxRequest()：
+     *      SET_BIT(TSR, ABRQx)。这是自动重传下的唯一逃生通道。
+     *   3) 中止后仍无空闲邮箱则放弃本帧并返回 0，绝不无限等待。 */
+    while ((mailbox > 2U) && (wait < MOTOR_CAN_TX_WAIT_TICKS))
     {
+        vTaskDelay(1U);
+        mailbox = motor_can_free_mailbox();
+        wait++;
     }
 
-    if ((CAN1->TSR & CAN_TSR_TME0) != 0U)
+    if (mailbox > 2U)
     {
-        mailbox = 0U;
+        CAN1->TSR |= (CAN_TSR_ABRQ0 | CAN_TSR_ABRQ1 | CAN_TSR_ABRQ2);
+
+        wait = 0U;
+        while ((mailbox > 2U) && (wait < MOTOR_CAN_TX_WAIT_TICKS))
+        {
+            vTaskDelay(1U);
+            mailbox = motor_can_free_mailbox();
+            wait++;
+        }
     }
-    else if ((CAN1->TSR & CAN_TSR_TME1) != 0U)
+
+    if (mailbox > 2U)
     {
-        mailbox = 1U;
-    }
-    else
-    {
-        mailbox = 2U;
+        return 0U;
     }
 
     CAN1->sTxMailBox[mailbox].TIR = ((std_id & 0x7FFU) << 21U) | CAN_TI0R_TXRQ;
