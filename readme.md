@@ -66,7 +66,7 @@
 | ModbusTask | 5 ms | +4 | RS485 帧解析、Modbus 03/06/10/04 协议、CAN 电机发送、FIFO 接收、心跳超时、参数落盘 |
 | FanTask    | 5 ms | +3 | 风机占空比斜坡、PWM 输出更新 |
 | PulseTask  | 10 ms| +2 | 500 ms 窗口 FG 测频、RPM 计算 |
-| LedTask    | 5 ms | +1 | RGB 彩虹呼吸指示 |
+| LedTask    | 5 ms | +1 | RGB 倾斜指示灯（色相=倾斜方向，饱和度=幅度，亮度=系统状态） |
 
 时基分工（与 `running` 对齐）：
 

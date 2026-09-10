@@ -32,6 +32,7 @@
 /* USER CODE BEGIN Includes */
 #include "bsp_fric.h"
 #include "bsp_led.h"
+#include "bsp_led_tilt.h"
 #include "bsp_modbus.h"
 #include "bsp_pulse.h"
 #include "ins_task.h"
@@ -137,7 +138,10 @@ static void LedTask_Entry(void *argument)
    (void)argument;
    for (;;)
    {
-       led_tick();
+       /* 倾斜指示灯：色相=倾斜方向，饱和度=幅度，亮度=系统状态
+        * （内部限流到 50Hz，5ms 调一次只是让限流更平滑）
+        * 注意：彩虹呼吸灯 led_tick() 已移除，两者争用同一组 TIM5 通道 */
+       led_tilt_update();
        vTaskDelay(pdMS_TO_TICKS(5U));
    }
 }
@@ -193,7 +197,9 @@ int main(void)
     /* 启动 PWM1~PWM4(PE9/PE11/PE13/PE14) 四路 FG 脉冲输入捕获 */
     pulse_capture_init();
 
-    /* 初始化板载 RGB LED（TIM5 + PH10/PH11/PH12），开启彩虹渐变+呼吸 */
+    /* 初始化板载 RGB LED（TIM5 + PH10/PH11/PH12）。
+     * 显示内容由 LedTask 里的 led_tilt_update() 决定（倾斜指示），
+     * 彩虹呼吸灯 led_tick() 已移除 —— 二者争用同一组 TIM5 通道。 */
     led_init();
 
     /* 初始化 RS485 Modbus RTU 从站 */
@@ -297,7 +303,11 @@ void SystemClock_Config(void)
 void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
-  /* User can add his own implementation to report the HAL error return state */
+  /* 红光无限闪烁（不返回），替代原来的空实现。
+   * 原来外设初始化失败会静默停在空函数里，现象是"板子像没跑起来"，
+   * 容易误判为硬件故障；现在一眼能看出是软件侧初始化失败。
+   * 注意：led_fatal_blink() 自己配置 GPIO，不依赖 led_init()。 */
+  led_fatal_blink();
 
   /* USER CODE END Error_Handler_Debug */
 }

@@ -46,6 +46,7 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/bsp/boards/bsp_fric.c
     ${CMAKE_CURRENT_SOURCE_DIR}/bsp/boards/bsp_led.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/bsp/boards/bsp_led_tilt.c
    ${CMAKE_CURRENT_SOURCE_DIR}/bsp/boards/bsp_modbus.c
    ${CMAKE_CURRENT_SOURCE_DIR}/bsp/boards/bsp_pulse.c
    ${CMAKE_CURRENT_SOURCE_DIR}/bsp/boards/bsp_spi.c

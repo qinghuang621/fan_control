@@ -10,16 +10,24 @@
 extern void led_init(void);
 
 /**
- * @brief LED 状态机周期调用
- * @note  在主循环里周期调用（推荐 5ms 一次），实现彩虹渐变+亮度呼吸
- *        色相 0~360° 约 3.9 秒一圈，亮度 0~255→0 约 1.3 秒一次，完整周期约 5 秒
+ * @brief 彩虹渐变 + 亮度呼吸
+ * @note  ⚠️ 已移除。它与倾斜指示灯（bsp_led_tilt.c）争夺同一组 TIM5
+ *        CCR1/2/3，二者只能二选一；本工程保留倾斜指示灯。
+ *        实现与回退说明见 bsp_led.c 中的注释块。
  */
-extern void led_tick(void);
+/* extern void led_tick(void); */
 
 /**
  * @brief 直接显示 aRGB 颜色（手动覆盖）
  * @param aRGB 0xAA RR GG BB，AA=alpha(亮度0~255), RR/GG/BB=0~255
  */
 extern void aRGB_led_show(uint32_t aRGB);
+
+/**
+ * @brief 致命错误报警：红光无限闪烁，**不返回**
+ * @note  供 Error_Handler() 调用。不依赖 led_init()，自己配置 PH10/11/12
+ *        为推挽输出后用忙等闪灯（可能在调度器启动前被调用）。
+ */
+extern void led_fatal_blink(void);
 
 #endif

@@ -74,38 +74,62 @@ void aRGB_led_show(uint32_t aRGB)
     __HAL_TIM_SetCompare(&s_htim5, TIM_CHANNEL_3, red);
 }
 
-/**
- * @brief 彩虹渐变 + 亮度呼吸（每 5ms 调用一次效果最佳）
- *        色相 0~1535 共 6 段 × 256，hue+=2 -> 768 步 × 5ms ≈ 3.9 秒一圈
- *        亮度 0~255 -> 256 步 × 5ms ≈ 1.3 秒呼吸一次
- *        完整周期约 5 秒
- */
-void led_tick(void)
+/* ============================================================================
+ * 彩虹渐变 + 亮度呼吸（led_tick）已移除
+ *
+ * 原因：它与倾斜指示灯（bsp_led_tilt.c）争夺同一组硬件资源 —— TIM5 的
+ * CCR1/2/3 分别驱动 PH10(蓝)/PH11(绿)/PH12(红)，全板只有这一组，后写者
+ * 覆盖先写者。两者共存会导致颜色乱闪、呼吸不成形。
+ *
+ * 例程 661c2-main/18.ins_task 的处理也是二选一（其 freertos.c 里把
+ * led_RGB_flow_task 的创建注释掉了，只保留 led_tilt_task）。
+ *
+ * 本工程选择保留倾斜指示灯：调试期它能直观反映 IMU 是否出数、倾斜方向
+ * 是否正确，价值高于纯装饰性的彩虹灯。呼吸语义由倾斜指示的亮度层承载
+ * （恒温加热中 1Hz 慢呼吸）。
+ *
+ * 如需回退彩虹灯：恢复下方 led_tick 实现，并让 LedTask 改调它、同时
+ * 停用 led_tilt_update()，二者不可同时运行。
+ * ========================================================================= */
+
+/* ============================================================================
+ * 致命错误报警：红光 SOS 式闪烁
+ *
+ * 用途：Error_Handler() 被调用时点亮红色，替代原来的"什么都不做"。
+ * 原来 Error_Handler 是空实现，SPI/DMA/CAN 等外设初始化失败会静默停在
+ * 空函数里，现象是"板子像没跑起来"，极易误判为硬件故障或不认为是软件问题。
+ *
+ * 实现要点（为什么不能直接调 aRGB_led_show）：
+ *   1. Error_Handler 可能在 led_init() 之前被调用（如 MX_GPIO_Init 失败），
+ *      此时 TIM5 还没配置，写 CCR 无效。所以这里**不依赖 led_init()**，
+ *      自己配置 PH10/11/12 为普通推挽输出，用软件延时闪灯。
+ *   2. 本函数**不返回**（保持原 Error_Handler 的语义：出错即停）。
+ *   3. 这里用忙等而非 vTaskDelay：本函数可能在调度器启动前被调用。
+ *
+ * LED 极性：C 板 LED 为高电平点亮（与 gpio.c 里 LED_R/G/B_Pin 初始 SET 一致）。
+ * ========================================================================= */
+void led_fatal_blink(void)
 {
-    static uint16_t hue   = 0;   /* 色相 0~1535 */
-    static uint8_t  alpha = 0;   /* 亮度 0~255 */
-    static int8_t   dir   = 1;   /* 亮度方向 +1/-1 */
-    uint8_t r, g, b;
+    GPIO_InitTypeDef gpio = {0};
+    volatile uint32_t i;
 
-    /* HSV 色相 -> RGB (饱和度 100%, 明度由 alpha 控制) */
-    if      (hue < 256)  { r = 255;            g = (uint8_t)hue;        b = 0;   }  /* R -> Y */
-    else if (hue < 512)  { r = (uint8_t)(511 - hue); g = 255;           b = 0;   }  /* Y -> G */
-    else if (hue < 768)  { r = 0;              g = 255;           b = (uint8_t)(hue - 512); }  /* G -> C */
-    else if (hue < 1024) { r = 0;              g = (uint8_t)(1023 - hue); b = 255; }  /* C -> B */
-    else if (hue < 1280) { r = (uint8_t)(hue - 1024); g = 0;            b = 255; }  /* B -> M */
-    else                 { r = 255;           g = 0;             b = (uint8_t)(1535 - hue); }  /* M -> R */
+    /* 自己开时钟 + 配引脚，不依赖 led_init() 是否已执行 */
+    __HAL_RCC_GPIOH_CLK_ENABLE();
 
-    /* 打包 aRGB: AA RR GG BB */
-    aRGB_led_show(((uint32_t)alpha << 24) |
-                  ((uint32_t)r << 16)     |
-                  ((uint32_t)g << 8)      |
-                  ((uint32_t)b));
+    gpio.Pin   = GPIO_PIN_10 | GPIO_PIN_11 | GPIO_PIN_12;
+    gpio.Mode  = GPIO_MODE_OUTPUT_PP;
+    gpio.Pull  = GPIO_PULLUP;
+    gpio.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOH, &gpio);
 
-    /* 步进 */
-    hue += 2;                    /* 色相每步 +2 */
-    if (hue >= 1536) hue = 0;
+    /* 无限闪烁：红亮 300ms / 灭 300ms，肉眼一眼可辨 */
+    for (;;)
+    {
+        HAL_GPIO_WritePin(GPIOH, GPIO_PIN_12, GPIO_PIN_SET);    /* 红亮 */
+        for (i = 0; i < 2000000U; i++) { __NOP(); }
 
-    alpha = (uint8_t)(alpha + dir);
-    if (alpha == 255) dir = -1;
-    if (alpha == 0)   dir =  1;
+        HAL_GPIO_WritePin(GPIOH, GPIO_PIN_12, GPIO_PIN_RESET);  /* 红灭 */
+        for (i = 0; i < 2000000U; i++) { __NOP(); }
+    }
 }
+
