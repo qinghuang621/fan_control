@@ -175,7 +175,7 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_DMA_Init();
-  MX_USART2_RS485_UART_Init();
+  MX_USART6_RS485_UART_Init();
   MX_USART3_UART_Init();
   MX_TIM8_Init();
   MX_TIM1_Init();

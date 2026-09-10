@@ -205,6 +205,7 @@ void DMA1_Stream1_IRQHandler(void)
 
 #include "tim.h"
 #include "spi.h"
+#include "bsp_modbus.h"   /* usart6_irq_handler() —— RS485 裸寄存器中断服务 */
 
 /* TIM1 捕获/比较中断（PWM1~PWM4 脉冲输入）
  * 注：只使用 CC 中断，不使用 TIM1 更新中断（TIM1_UP_TIM10） */
@@ -213,9 +214,26 @@ void TIM1_CC_IRQHandler(void)
     HAL_TIM_IRQHandler(&htim1);
 }
 
-void USART2_IRQHandler(void)
+/* USART6 全局中断：RS485 Modbus RTU 从站收发
+ * （huart2 句柄即 USART6，见 Src/usart.c。
+ *   C 板外壳丝印 UART1 的 3-pin 口 → MCU 实际是 USART6，PG14/PG9）
+ *
+ * 注意：这里**不调用 HAL_UART_IRQHandler**，而是走自管的裸寄存器中断，
+ * 与 running 的 Middlewares/Third_Party/FreeModbus/modbus/port/portserial.c 一致：
+ *   - 直接在中断里读 SR/DR，避免 HAL 状态机与裸寄存器操作冲突；
+ *   - 每次中断都顺手清 ORE/FE/NE/PE，杜绝"一次溢出后接收永久停摆"；
+ *   - TXE 逐字节发送、TC 才切回 RS485 接收方向，防止截断最后一位。 */
+void USART6_IRQHandler(void)
 {
-    HAL_UART_IRQHandler(&huart2);
+    usart6_irq_handler();
+}
+
+/* CAN1 RX0 中断：接收达妙电机状态上报帧。
+ * 走 HAL（HAL_CAN_IRQHandler → HAL_CAN_RxFifo0MsgPendingCallback），
+ * 与 running 一致：中断里只把帧搬进 FreeRTOS 队列，寄存器更新在任务上下文做。 */
+void CAN1_RX0_IRQHandler(void)
+{
+    motor_can_irq_handler();
 }
 
 /* TIM6 更新中断：HAL 1ms 时基（替代 SysTick） */

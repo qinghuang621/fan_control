@@ -74,6 +74,10 @@ add_library(FreeRTOS OBJECT)
 target_sources(FreeRTOS PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/Middlewares/Third_Party/FreeRTOS/Source/list.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Middlewares/Third_Party/FreeRTOS/Source/tasks.c
+    # queue.c：CAN 接收帧走 FreeRTOS 队列（HAL_CAN_RxFifo0MsgPendingCallback
+    # → xQueueSendFromISR，CanTask/ModbusTask → xQueueReceive），与 running 一致。
+    # 之前只用任务通知，故未编入；改成队列方案后必须加。
+    ${CMAKE_CURRENT_SOURCE_DIR}/Middlewares/Third_Party/FreeRTOS/Source/queue.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Middlewares/Third_Party/FreeRTOS/Source/portable/MemMang/heap_4.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Middlewares/Third_Party/FreeRTOS/Source/portable/GCC/ARM_CM4F/port.c
 )

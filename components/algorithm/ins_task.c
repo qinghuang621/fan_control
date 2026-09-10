@@ -464,19 +464,28 @@ uint8_t ins_init(void)
     s_ins_status = INS_STATUS_WARMUP;
     {
         uint32_t t0 = xTaskGetTickCount();
+        uint32_t elapsed_ms;
+
         while (!s_first_temperate)
         {
             /* 加热期间也需要读温度，但数据流依赖 DRDY 中断；
              * 这里直接用阻塞式读温度，简单可靠（加热阶段对实时性无要求）。 */
-            float t;
-            get_BMI088_temperate();
-            t = get_BMI088_temperate();
+            float t = get_BMI088_temperate();
             imu_temp_control(t);
 
-            if ((xTaskGetTickCount() - t0) * portTICK_PERIOD_MS > INS_TEMP_BOOT_TIMEOUT_MS)
+            /* 独立超时兜底：不依赖 imu_temp_control() 内部是否置位成功。
+             * 曾出现"永久停在 WARMUP、灯一直蓝绿呼吸"的现象——只要内部
+             * 达标判据因任何原因失效（目标温度被改、温度换算异常、确认
+             * 计数被反复清零），这里就会无限等下去，整个系统卡死。
+             * 本工程的 INS_TEMP_BOOT_TIMEOUT_MS 单位是 ms，tick 率 1kHz，
+             * 故用 pdMS_TO_TICKS 换算后比较，避免手动乘 portTICK_PERIOD_MS
+             * 这种易错写法。 */
+            elapsed_ms = (uint32_t)((xTaskGetTickCount() - t0) * portTICK_PERIOD_MS);
+            if (elapsed_ms > INS_TEMP_BOOT_TIMEOUT_MS)
             {
                 s_first_temperate = 1U;
                 s_heater_pid.Iout = HEATER_PID_MAX_OUT / 2.0f;
+                break;
             }
             vTaskDelay(pdMS_TO_TICKS(50));
         }

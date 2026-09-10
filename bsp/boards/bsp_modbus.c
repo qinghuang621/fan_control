@@ -7,15 +7,45 @@
 #include "bsp_pulse.h"
 #include "ins_task.h"
 
-/* CAN 发送等待邮箱时需要 vTaskDelay() 让出 CPU，见 motor_can_send_frame() */
+/* CAN 使用 HAL API + 中断队列（对齐 running），邮箱等待需 vTaskDelay() 让出 CPU */
 #include "FreeRTOS.h"
 #include "task.h"
+#include "queue.h"
 
 #include <string.h>
 #include <math.h>
 
 #define MODBUS_SLAVE_ADDR 0x01U
 #define MODBUS_RX_RING_SIZE 128U
+/* 帧间静默超时（ms）：Modbus RTU 用 3.5 字符间隔分帧。
+ * 115200 8N1 下一个字符约 87us，3.5 字符 ≈ 305us；取 4ms 留足余量，
+ * 远小于上位机默认 1000ms 扫描周期，不会误切正常帧。用来丢弃残缺帧。 */
+#define MODBUS_FRAME_GAP_MS 4U
+
+/* ==================== RS485 底层：裸寄存器 + 自管中断 ====================
+ * 与 running 的 Middlewares/Third_Party/FreeModbus/modbus/port/portserial.c 对齐：
+ * **完全绕过 HAL UART 驱动**，USART6_IRQHandler 里直接读 SR/DR 处理收发。
+ *
+ * 为什么必须这么做（都是实际踩过的坑）：
+ *   1. HAL_UART_Receive_IT 是逐字节状态机。一旦发生 ORE 溢出，HAL 会**关闭 RXNE 中断**
+ *      并进入错误回调；若没接 HAL_UART_ErrorCallback，接收就**永久停摆**
+ *      （RxState 卡在 BUSY_RX），但 TX 仍正常 —— 现象是"发得出去、收不到回包"。
+ *      running 的做法是**每次中断都检查并清 ORE**，根本不给它停摆的机会。
+ *   2. HAL_UART_Transmit 返回时最后一个字节可能还在移位寄存器里，
+ *      此时立刻拉低 RS485 方向脚（PG8）会**截断最后一位**。
+ *      running 用 **TC（发送完成）中断** 才切回接收，保证移出完整。
+ *
+ * RS485 方向：PG8 高=发送，低=接收。
+ */
+static volatile uint8_t s_rx_buf[MODBUS_RX_RING_SIZE];
+static volatile uint16_t s_rx_head = 0U;
+static volatile uint16_t s_rx_tail = 0U;
+
+/* 发送状态：s_tx_buf 为 NULL 表示空闲 */
+static const uint8_t *s_tx_buf = NULL;
+static volatile uint16_t s_tx_len = 0U;
+static volatile uint16_t s_tx_pos = 0U;
+
 /* 保持寄存器总数。
  * 0x0000~0x00BF 与 running（Core/Inc/registers.h, REG_HOLDING_COUNT=256）逐地址一致：
  *   0x0000~0x003F 控制区 / 0x0040~0x008F CAN 电机状态 / 0x0090~0x00BF 参数区
@@ -85,6 +115,37 @@ static const uint8_t c_cmd_clear_err[8] = {0xFFU, 0xFFU, 0xFFU, 0xFFU, 0xFFU, 0x
 #define REG_PARAM_UART_CFG 0x0090U
 #define REG_PARAM_SLAVE_ADDR 0x0091U
 
+/* 串口配置枚举表（对齐 running Core/Src/uart_config.c）。
+ * 保持寄存器 0x0090 存枚举下标，上电查表得到波特率/校验，下次断电重启生效。
+ * 之前本工程把 0x0090 写死成 0 且从不使用 —— 上位机改这个寄存器毫无效果，
+ * 属功能缺口，故补齐。越界一律回退 index 0（115200 8N1）。 */
+typedef struct
+{
+    uint32_t baud;
+    uint32_t parity;   /* UART_PARITY_NONE / EVEN / ODD */
+} uart_cfg_t;
+
+static const uart_cfg_t s_uart_cfg_table[] = {
+    { 115200U, UART_PARITY_NONE },   /* 0: 115200 8N1（默认） */
+    { 115200U, UART_PARITY_EVEN },   /* 1: 115200 8E1 */
+    { 19200U,  UART_PARITY_NONE },   /* 2: 19200 8N1 */
+    { 19200U,  UART_PARITY_EVEN },   /* 3: 19200 8E1 */
+    { 9600U,   UART_PARITY_NONE },   /* 4: 9600 8N1 */
+    { 9600U,   UART_PARITY_EVEN },   /* 5: 9600 8E1 */
+    { 38400U,  UART_PARITY_NONE },   /* 6: 38400 8N1 */
+    { 57600U,  UART_PARITY_NONE },   /* 7: 57600 8N1（本工程扩展项） */
+};
+#define UART_CFG_COUNT (sizeof(s_uart_cfg_table) / sizeof(s_uart_cfg_table[0]))
+
+static const uart_cfg_t *uart_cfg_lookup(uint16_t idx)
+{
+    if (idx >= (uint16_t)UART_CFG_COUNT)
+    {
+        idx = 0U;
+    }
+    return &s_uart_cfg_table[idx];
+}
+
 /* ==================== 风机自动模式（姿态前馈）参数区 0x0140~0x014F ====================
  * 风机占空比不再只由外部写 0x0100 决定，而是可以由 InsTask 依据 IMU 姿态自动生成。
  * 控制律（重力分量补偿开环前馈）：
@@ -108,7 +169,7 @@ static const uint8_t c_cmd_clear_err[8] = {0xFFU, 0xFFU, 0xFFU, 0xFFU, 0xFFU, 0x
 #define REG_AUTO_MAG_STATUS    0x014BU  /* 磁力计状态：本轮恒 2=未接入（只读） */
 #define REG_AUTO_MAG_CAL_CMD   0x014CU  /* 磁校准命令：保留，本轮无实现 */
 #define REG_AUTO_HEATER_TARGET 0x014DU  /* 恒温目标温度(℃)，float32 需占 2 个寄存器到 0x014E */
-/* 0x014F 预留 */
+#define REG_AUTO_HEATER_PWM    0x014FU  /* 诊断用：当前加热 PWM 值（只读，0~5000） */
 
 /* ==================== IMU 姿态输出区 0x0150~0x015F（只读） ====================
  * 每个量为 float32，高字在前（与电机状态区同序），占 2 个寄存器。
@@ -123,11 +184,10 @@ static const uint8_t c_cmd_clear_err[8] = {0xFFU, 0xFFU, 0xFFU, 0xFFU, 0xFFU, 0x
 #define REG_IMU_GYRO_Z         0x015AU  /* rad/s */
 #define REG_IMU_AUTO_DUTY      0x015CU  /* 自动模式下当前计算的占空比(%) */
 #define REG_IMU_STATUS         0x015EU  /* 0=离线 1=加热中 2=运行 3=错误 */
+/* 诊断用：温度×10 的有符号整数（如 43.5℃ -> 435）。放不下 float32，
+ * 故用整数形式占最后 1 个寄存器。用于排查"卡在 WARMUP"这类问题。 */
+#define REG_IMU_TEMP_X10       0x015FU
 
-static volatile uint8_t s_rx_ring[MODBUS_RX_RING_SIZE];
-static volatile uint16_t s_rx_head = 0U;
-static volatile uint16_t s_rx_tail = 0U;
-static uint8_t s_rx_byte = 0U;
 static uint16_t s_holding_regs[MODBUS_REG_COUNT];
 static uint8_t s_param_dirty = 0U;
 static uint32_t s_param_dirty_tick_ms = 0U;
@@ -199,6 +259,8 @@ static uint32_t crc32_buffer(const uint8_t *buf, uint32_t len)
     return (crc ^ 0xFFFFFFFFUL);
 }
 
+/* ==================== 收发底层（裸寄存器，对齐 running portserial.c） ==================== */
+
 static uint16_t ring_len(void)
 {
     if (s_rx_head >= s_rx_tail)
@@ -214,32 +276,153 @@ static uint8_t ring_pop(uint8_t *out_byte)
     {
         return 0U;
     }
-    *out_byte = s_rx_ring[s_rx_tail];
+    *out_byte = s_rx_buf[s_rx_tail];
     s_rx_tail = (uint16_t)((s_rx_tail + 1U) % MODBUS_RX_RING_SIZE);
     return 1U;
 }
 
-static void ring_push(uint8_t byte)
+/* 只在 USART6 中断里调用 */
+static void ring_push_isr(uint8_t byte)
 {
     uint16_t next = (uint16_t)((s_rx_head + 1U) % MODBUS_RX_RING_SIZE);
     if (next == s_rx_tail)
     {
+        /* 溢出：丢掉最旧一个字节，保证最新数据优先（与 running 的覆盖语义一致） */
         s_rx_tail = (uint16_t)((s_rx_tail + 1U) % MODBUS_RX_RING_SIZE);
     }
-    s_rx_ring[s_rx_head] = byte;
+    s_rx_buf[s_rx_head] = byte;
     s_rx_head = next;
 }
 
+/* RS485 方向：PG8 高=发送，低=接收 */
 static void rs485_set_tx(uint8_t enable)
 {
     HAL_GPIO_WritePin(GPIOG, GPIO_PIN_8, enable ? GPIO_PIN_SET : GPIO_PIN_RESET);
 }
 
+/* 清 ORE/FE/NE/PE：F4 上「读 SR 再读 DR」即为硬件要求的清除序列。
+ * 与 running portserial.c 里 `(volatile void)huart2.Instance->DR;` 等价。 */
+static void usart6_clear_err_flags(void)
+{
+    (void)USART6->SR;
+    (void)USART6->DR;
+}
+
+/* 使能/关闭接收（对齐 running vMBPortSerialEnable） */
+static void rs485_rx_enable(uint8_t enable)
+{
+    if (enable)
+    {
+        rs485_set_tx(0U);                  /* 切到接收方向 */
+        usart6_clear_err_flags();          /* 清掉残留 ORE，再开中断 */
+        SET_BIT(USART6->CR1, USART_CR1_RXNEIE);
+    }
+    else
+    {
+        CLEAR_BIT(USART6->CR1, USART_CR1_RXNEIE);
+    }
+}
+
+/* 启动一次中断驱动的发送。
+ * 与 running 一致：**先切到发送方向，再打开 TXE 中断**，由中断逐字节吐数据，
+ * 最后用 TC 中断切回接收。这样不会像 HAL_UART_Transmit 那样提前拉低方向脚、
+ * 把最后一个字节（尤其奇偶校验位）截断。 */
 static void modbus_send_frame(const uint8_t *frame, uint16_t len)
 {
-    rs485_set_tx(1U);
-    HAL_UART_Transmit(&huart2, (uint8_t *)frame, len, MODBUS_RTU_TIMEOUT_MS);
-    rs485_set_tx(0U);
+    if ((len == 0U) || (s_tx_buf != NULL))
+    {
+        return;   /* 上一帧还没发完，丢弃本帧（不会发生：Modbus 一问一答） */
+    }
+
+    /* 发送是中断驱动的，s_tx_buf 只保存指针。frame 必须活到 TC 中断触发为止。
+     * 因此调用方**必须传入常驻缓冲**（如 modbus_poll 里的 static response[]），
+     * 不能用栈上的局部数组 —— 函数返回后栈帧可能被覆盖，中断吐出的就是脏数据。 */
+    s_tx_buf = frame;
+    s_tx_len = len;
+    s_tx_pos = 0U;
+
+    rs485_set_tx(1U);                      /* 切到发送方向 */
+    __HAL_UART_CLEAR_FLAG(&huart2, UART_FLAG_TC);
+    SET_BIT(USART6->CR1, USART_CR1_TXEIE); /* 打开 TXE 中断，开始吐数据 */
+}
+
+/* 等待上一帧发送完成（超时兜底）。返回 1=已发完。
+ * ⚠️ 本函数跑在 ModbusTask（最高优先级 idle+4），**必须让出 CPU**：
+ * 串口中断优先级低于任务，若任务在这里空转，中断永远进不来，会死等到超时。
+ * 故每轮 vTaskDelay(1) 阻塞 1ms —— 发送一帧最多 3.5ms，4 轮就够。 */
+static uint8_t modbus_tx_wait_done(uint32_t timeout_ms)
+{
+    uint32_t t0 = HAL_GetTick();
+    while ((s_tx_buf != NULL) && ((HAL_GetTick() - t0) < timeout_ms))
+    {
+        vTaskDelay(1);
+    }
+    return (s_tx_buf == NULL) ? 1U : 0U;
+}
+
+/* ---------------- USART6 中断服务（由 Src/stm32f4xx_it.c 调用） ----------------
+ * 与 running 的 vMBPortSerialIRQHandler 结构一致：
+ *   ① RXNE  → 读 DR 存入 FIFO
+ *   ② 错误标志 → 读 DR 清除（每次中断都查，ORE 不给它停摆的机会）
+ *   ③ TXE   → 写下一字节；写完关 TXE、开 TC
+ *   ④ TC    → 关 TC、切回接收方向，发送结束
+ * 注意：**不调用 HAL_UART_IRQHandler**，避免 HAL 状态机与裸寄存器操作打架。 */
+void usart6_irq_handler(void)
+{
+    uint32_t sr  = USART6->SR;
+    uint32_t cr1 = USART6->CR1;
+
+    /* ① RXNE：收到一个字节 */
+    if ((sr & USART_SR_RXNE) != 0U)
+    {
+        uint8_t byte = (uint8_t)(USART6->DR & 0xFFU);
+        if ((cr1 & USART_CR1_RXNEIE) != 0U)
+        {
+            ring_push_isr(byte);
+        }
+        /* 未使能接收时读 DR 即已丢弃，同时防止 ORE */
+    }
+
+    /* ② ORE/FE/NE/PE：读 SR 再读 DR 清除。RXNE 分支已经读过 DR，
+     *    这里再显式清一次，覆盖"只有错误没有 RXNE"的情况。 */
+    if ((sr & (USART_SR_ORE | USART_SR_FE | USART_SR_NE | USART_SR_PE)) != 0U)
+    {
+        usart6_clear_err_flags();
+    }
+
+    /* 上面的读操作可能改变标志，重新采样 */
+    sr  = USART6->SR;
+    cr1 = USART6->CR1;
+
+    /* ③ TXE：数据寄存器空，写下一字节 */
+    if (((sr & USART_SR_TXE) != 0U) && ((cr1 & USART_CR1_TXEIE) != 0U))
+    {
+        if ((s_tx_buf != NULL) && (s_tx_pos < s_tx_len))
+        {
+            USART6->DR = (uint8_t)s_tx_buf[s_tx_pos++];
+        }
+
+        if ((s_tx_buf != NULL) && (s_tx_pos >= s_tx_len))
+        {
+            /* 最后一个字节已写入 DR，关 TXE、开 TC，等它完全移出 */
+            CLEAR_BIT(USART6->CR1, USART_CR1_TXEIE);
+            __HAL_UART_CLEAR_FLAG(&huart2, UART_FLAG_TC);
+            SET_BIT(USART6->CR1, USART_CR1_TCIE);
+        }
+    }
+
+    /* ④ TC：最后一个字节完全移出，切回接收方向并结束发送 */
+    if (((sr & USART_SR_TC) != 0U) && ((cr1 & USART_CR1_TCIE) != 0U))
+    {
+        CLEAR_BIT(USART6->CR1, USART_CR1_TCIE);
+        __HAL_UART_CLEAR_FLAG(&huart2, UART_FLAG_TC);
+
+        s_tx_buf = NULL;
+        s_tx_len = 0U;
+        s_tx_pos = 0U;
+
+        rs485_set_tx(0U);   /* 切回接收（等 TC 才切，不截断最后一位） */
+    }
 }
 
 static uint16_t clamp_duty(uint16_t v)
@@ -410,10 +593,16 @@ static void fan_auto_update(void)
 static void refresh_imu_registers(void)
 {
     ins_snapshot_t snap;
+    float temp;
+    int32_t t10;
+
+    /* 状态与诊断信息先刷：即使 seqlock 读失败也要更新，
+     * 否则"卡在 WARMUP"时上位机看到的状态是陈旧的，无法定位。 */
+    s_holding_regs[REG_IMU_STATUS] = (uint16_t)ins_get_status();
 
     if (!INS_get_snapshot(&snap))
     {
-        return;   /* 正在更新，下轮再来 */
+        return;   /* 姿态数据正在更新，下轮再来 */
     }
 
     write_float32_le(s_holding_regs, REG_IMU_ROLL,     snap.roll);
@@ -423,7 +612,13 @@ static void refresh_imu_registers(void)
     write_float32_le(s_holding_regs, REG_IMU_GYRO_Y,   snap.gyro_y);
     write_float32_le(s_holding_regs, REG_IMU_GYRO_Z,   snap.gyro_z);
     write_float32_le(s_holding_regs, REG_IMU_AUTO_DUTY, (float)fan_auto_duty);
-    s_holding_regs[REG_IMU_STATUS] = (uint16_t)ins_get_status();
+
+    /* 温度 ×10 存为有符号整数（诊断用）。钳位到 int16 范围防溢出。 */
+    temp = snap.temperature;
+    t10 = (int32_t)(temp * 10.0f);
+    if (t10 > 32767)  { t10 = 32767; }
+    if (t10 < -32768) { t10 = -32768; }
+    s_holding_regs[REG_IMU_TEMP_X10] = (uint16_t)(int16_t)t10;
 }
 
 static uint8_t retentive_read_block(uint32_t addr, retentive_block_t *out_block)
@@ -658,6 +853,19 @@ static void motor_kinematics_resolve(void)
     }
 }
 
+/* ==================== CAN：HAL API + 中断队列（对齐 running can.c / freertos.c） ==================== */
+
+/* 电机状态上报帧队列元素（与 running freertos.c 的 CanRxMsg_t 逐字段一致） */
+typedef struct
+{
+    uint32_t id;
+    uint8_t  data[8];
+    uint8_t  dlc;
+} CanRxMsg_t;
+
+static CAN_HandleTypeDef hcan1;
+static QueueHandle_t s_can_rx_queue = NULL;
+
 static void MX_CAN1_Init(void)
 {
     /* CAN1 引脚：PD0 = CAN1_RX，PD1 = CAN1_TX（AF9），依据 RoboMaster C 板用户手册。
@@ -675,121 +883,106 @@ static void MX_CAN1_Init(void)
     gpio_init.Alternate = GPIO_AF9_CAN1;
     HAL_GPIO_Init(GPIOD, &gpio_init);
 
-    CAN1->MCR |= CAN_MCR_INRQ;
-    while ((CAN1->MSR & CAN_MSR_INAK) == 0U)
+    /* 位时间参数与 running（Core/Src/can.c）逐项一致：
+     *   Prescaler=3 / SJW=1TQ / BS1=11TQ / BS2=2TQ / AutoRetransmission=ENABLE
+     * PCLK1 = 42MHz，位时间 = 1+11+2 = 14TQ → 42MHz/(3*14) = 1.000 Mbps，采样点 85.7% */
+    hcan1.Instance = CAN1;
+    hcan1.Init.Prescaler = 3;
+    hcan1.Init.Mode = CAN_MODE_NORMAL;
+    hcan1.Init.SyncJumpWidth = CAN_SJW_1TQ;
+    hcan1.Init.TimeSeg1 = CAN_BS1_11TQ;
+    hcan1.Init.TimeSeg2 = CAN_BS2_2TQ;
+    hcan1.Init.TimeTriggeredMode = DISABLE;
+    hcan1.Init.AutoBusOff = DISABLE;
+    hcan1.Init.AutoWakeUp = DISABLE;
+    /* 保持自动重传开启，与 running 一致：总线上的偶发错误帧能自动补发，不丢关键命令。
+     * 代价是"总线上无节点应答时硬件会无限重传并占满三个发送邮箱"，
+     * 由 motor_can_send_frame() 里"邮箱满 → abort 三个 pending 邮箱"兜底。 */
+    hcan1.Init.AutoRetransmission = ENABLE;
+    hcan1.Init.ReceiveFifoLocked = DISABLE;
+    hcan1.Init.TransmitFifoPriority = DISABLE;
+    if (HAL_CAN_Init(&hcan1) != HAL_OK)
     {
+        Error_Handler();
     }
 
-    /* 与 running (hcan1.Init.AutoRetransmission = ENABLE) 对齐：保持自动重传开启，
-     * 总线上的偶发错误帧能自动补发，不会丢关键命令。
-     *
-     * 自动重传的代价是"总线上无节点应答时硬件会无限重传并占满三个发送邮箱"，
-     * 这个风险由 motor_can_send_frame() 负责兜底：邮箱满时先短暂等待（vTaskDelay
-     * 让出 CPU），仍满就中止三个 pending 邮箱，保证当前关键帧能发出去。
-     *
-     * 注：此前曾开启 CAN_MCR_NART（禁止自动重传）来缓解邮箱占满，但那样会丢掉
-     * 偶发错误的帧，且与 running 语义不一致，故改回自动重传 + 超时中止的方案。 */
-    CAN1->MCR |= CAN_MCR_ABOM | CAN_MCR_AWUM | CAN_MCR_TXFP;
-
-    /* 位时间配置，PCLK1 = 42MHz，目标 1Mbps，与 running (PSC=3 / BS1=11TQ / BS2=2TQ / SJW=1TQ) 一致：
-     *   SJW[25:24] = 0   -> 1TQ
-     *   TS2 [22:20] = 1  -> 2TQ
-     *   TS1 [19:16] = 10 -> 11TQ
-     *   BRP [9:0]   = 2  -> 分频 3
-     * 位时间 = 1 + 11 + 2 = 14 TQ  ->  42MHz / (3 * 14) = 1.000 Mbps，采样点 85.7%
-     * 合值 0x001A0002。
-     *
-     * 修正前为 (3<<16)|(13<<8)|(2<<4)，13 落入保留位、2 把 BRP 撑成 289，
-     * 实际波特率仅 42MHz/(289*6) ≈ 24.2 kbps，达妙电机不会响应。 */
-    CAN1->BTR = (uint32_t)((0U << 24U) |    /* SJW  = 0  -> 1TQ  */
-                           (1U << 20U) |    /* TS2  = 1  -> 2TQ  */
-                           (10U << 16U) |   /* TS1  = 10 -> 11TQ */
-                           2U);             /* BRP  = 2  -> PSC=3 */
-
-    CAN1->FMR |= CAN_FMR_FINIT;
-    CAN1->FA1R = 0U;
-    CAN1->FM1R = 0U;
-    CAN1->FS1R = 0x00000001U;
-    CAN1->FFA1R = 0U;
-    CAN1->sFilterRegister[0].FR1 = 0x00000000U;
-    CAN1->sFilterRegister[0].FR2 = 0x00000000U;
-    CAN1->FA1R |= 1U;
-    CAN1->FMR &= ~CAN_FMR_FINIT;
-
-    CAN1->MCR &= ~CAN_MCR_INRQ;
-    while ((CAN1->MSR & CAN_MSR_INAK) != 0U)
+    /* 过滤器：32 位 IDMASK，全 0 掩码接收所有标准帧（与 running can.c 一致）。
+     * SlaveStartFilterBank 只是给双 CAN（CAN2 起始 bank）用的提示，
+     * 本芯片只用 CAN1，填 14 与 running 保持一致，无副作用。 */
+    CAN_FilterTypeDef filter = {0};
+    filter.FilterBank = 0U;
+    filter.FilterMode = CAN_FILTERMODE_IDMASK;
+    filter.FilterScale = CAN_FILTERSCALE_32BIT;
+    filter.FilterIdHigh = 0x0000U;
+    filter.FilterIdLow = 0x0000U;
+    filter.FilterMaskIdHigh = 0x0000U;
+    filter.FilterMaskIdLow = 0x0000U;
+    filter.FilterFIFOAssignment = CAN_FILTER_FIFO0;
+    filter.FilterActivation = CAN_FILTER_ENABLE;
+    filter.SlaveStartFilterBank = 14U;
+    if (HAL_CAN_ConfigFilter(&hcan1, &filter) != HAL_OK)
     {
+        Error_Handler();
     }
-}
+    if (HAL_CAN_Start(&hcan1) != HAL_OK)
+    {
+        Error_Handler();
+    }
 
-/* 取空闲发送邮箱号：0/1/2 = 可用邮箱，3 = 三个邮箱都忙 */
-static uint8_t motor_can_free_mailbox(void)
-{
-    if ((CAN1->TSR & CAN_TSR_TME0) != 0U)
-    {
-        return 0U;
-    }
-    if ((CAN1->TSR & CAN_TSR_TME1) != 0U)
-    {
-        return 1U;
-    }
-    if ((CAN1->TSR & CAN_TSR_TME2) != 0U)
-    {
-        return 2U;
-    }
-    return 3U;
+    /* CAN1_RX0 中断优先级 5（与 running can.c 的 HAL_CAN_MspInit 一致）。
+     * 本工程没有独立的 HAL_CAN_MspInit，GPIO/时钟已在上面手配，NVIC 在此补齐。
+     * 中断服务函数 CAN1_RX0_IRQHandler 在 Src/stm32f4xx_it.c，
+     * 内部调 HAL_CAN_IRQHandler → HAL_CAN_RxFifo0MsgPendingCallback。 */
+    HAL_NVIC_SetPriority(CAN1_RX0_IRQn, 5, 0);
+    HAL_NVIC_EnableIRQ(CAN1_RX0_IRQn);
 }
 
 static uint8_t motor_can_send_frame(uint32_t std_id, const uint8_t *data, uint8_t len)
 {
-    uint8_t mailbox = motor_can_free_mailbox();
-    uint8_t wait = 0U;
+    CAN_TxHeaderTypeDef txh;
+    uint32_t mb = 0U;
 
     if (len > 8U)
     {
         return 0U;
     }
 
-    /* 与 running 的 CanTask_Send() 对齐（Core/Src/freertos.c:288）：
+    txh.StdId = std_id;
+    txh.IDE = CAN_ID_STD;
+    txh.RTR = CAN_RTR_DATA;
+    txh.DLC = len;
+    txh.TransmitGlobalTime = DISABLE;
+    txh.ExtId = 0U;
+
+    /* 与 running 的 CanTask_Send() 对齐（Core/Src/freertos.c:289）：
      * 保持自动重传开启（NART=0）后，总线上没有节点应答时硬件会无限重传并占满三个
      * 发送邮箱，因此邮箱满时必须能逃生。三步：
      *
      *   1) 先等待几个 tick，且用 vTaskDelay() 让出 CPU。
-     *      原实现是 while 空转死等，而本函数运行在最高优先级的 ModbusTask 里，
-     *      空转会把它下面三个任务（Fan/Pulse/Led）全部饿死，RS485 也跟着不回应。
+     *      本函数运行在最高优先级的 ModbusTask 里，空转会把它下面三个任务
+     *      （Fan/Pulse/Led）全部饿死，RS485 也跟着不回应。
      *   2) 等待超时后中止三个 pending 邮箱，等价 HAL_CAN_AbortTxRequest()：
-     *      SET_BIT(TSR, ABRQx)。这是自动重传下的唯一逃生通道。
+     *      这是自动重传下的唯一逃生通道（与 running 逐条对应）。
      *   3) 中止后仍无空闲邮箱则放弃本帧并返回 0，绝不无限等待。 */
-    while ((mailbox > 2U) && (wait < MOTOR_CAN_TX_WAIT_TICKS))
+    if (HAL_CAN_GetTxMailboxesFreeLevel(&hcan1) == 0U)
     {
-        vTaskDelay(1U);
-        mailbox = motor_can_free_mailbox();
-        wait++;
-    }
-
-    if (mailbox > 2U)
-    {
-        CAN1->TSR |= (CAN_TSR_ABRQ0 | CAN_TSR_ABRQ1 | CAN_TSR_ABRQ2);
-
-        wait = 0U;
-        while ((mailbox > 2U) && (wait < MOTOR_CAN_TX_WAIT_TICKS))
+        uint8_t wait = 0U;
+        while ((HAL_CAN_GetTxMailboxesFreeLevel(&hcan1) == 0U) && (wait < MOTOR_CAN_TX_WAIT_TICKS))
         {
             vTaskDelay(1U);
-            mailbox = motor_can_free_mailbox();
             wait++;
+        }
+        if (HAL_CAN_GetTxMailboxesFreeLevel(&hcan1) == 0U)
+        {
+            /* 三个邮箱都还在重传，全部中止，优先保证当前关键帧能发出去。
+             * 逐个判断 TME 位：只有"非空"的邮箱才需要 abort（与 running 写法一致）。 */
+            if ((CAN1->TSR & CAN_TSR_TME0) == 0U) { (void)HAL_CAN_AbortTxRequest(&hcan1, CAN_TX_MAILBOX0); }
+            if ((CAN1->TSR & CAN_TSR_TME1) == 0U) { (void)HAL_CAN_AbortTxRequest(&hcan1, CAN_TX_MAILBOX1); }
+            if ((CAN1->TSR & CAN_TSR_TME2) == 0U) { (void)HAL_CAN_AbortTxRequest(&hcan1, CAN_TX_MAILBOX2); }
         }
     }
 
-    if (mailbox > 2U)
-    {
-        return 0U;
-    }
-
-    CAN1->sTxMailBox[mailbox].TIR = ((std_id & 0x7FFU) << 21U) | CAN_TI0R_TXRQ;
-    CAN1->sTxMailBox[mailbox].TDTR = len;
-    CAN1->sTxMailBox[mailbox].TDLR = (uint32_t)data[0] | ((uint32_t)data[1] << 8U) | ((uint32_t)data[2] << 16U) | ((uint32_t)data[3] << 24U);
-    CAN1->sTxMailBox[mailbox].TDHR = (uint32_t)data[4] | ((uint32_t)data[5] << 8U) | ((uint32_t)data[6] << 16U) | ((uint32_t)data[7] << 24U);
-    return 1U;
+    return (HAL_CAN_AddTxMessage(&hcan1, &txh, (uint8_t *)data, &mb) == HAL_OK) ? 1U : 0U;
 }
 
 static void motor_can_send_speed(uint16_t motor_index, float speed)
@@ -1061,12 +1254,19 @@ static uint8_t process_request(const uint8_t *request, uint16_t len, uint8_t *re
             response[1] = func;
             response[2] = (uint8_t)(qty * 2U);
             uint16_t pos = 3U;
+            /* 短临界区（对齐 running Regs_HoldingSnapshot）：
+             * 多字 float32 由两个寄存器组成，若不加锁，
+             * CAN RX 中断（优先级 5）可能在本轮复制中途更新后半字，
+             * 上位机就会读到"半新半旧"的撕裂值（表现为速度/位置偶发跳变）。
+             * 逐字节接收已在任务上下文，复制很快，临界区开销可忽略。 */
+            taskENTER_CRITICAL();
             for (uint16_t i = 0U; i < qty; ++i)
             {
                 uint16_t v = s_holding_regs[start + i];
                 response[pos++] = (uint8_t)((v >> 8U) & 0xFFU);
                 response[pos++] = (uint8_t)(v & 0xFFU);
             }
+            taskEXIT_CRITICAL();
             uint16_t crc = crc16_buffer(response, pos);
             response[pos++] = (uint8_t)(crc & 0xFFU);
             response[pos++] = (uint8_t)((crc >> 8U) & 0xFFU);
@@ -1155,20 +1355,55 @@ void modbus_init(void)
     retentive_load_params();
     refresh_fan_state_registers();
 
+    /* CAN RX 队列 + 中断使能（与 running CanTask_Entry 一致）：
+     * 先建队列再激活通知，避免中断在队列就绪前触发导致丢帧。 */
+    if (s_can_rx_queue == NULL)
+    {
+        s_can_rx_queue = xQueueCreate(16U, sizeof(CanRxMsg_t));
+    }
+    if (s_can_rx_queue != NULL)
+    {
+        if (HAL_CAN_ActivateNotification(&hcan1, CAN_IT_RX_FIFO0_MSG_PENDING) != HAL_OK)
+        {
+            Error_Handler();
+        }
+    }
+
     s_rx_head = 0U;
     s_rx_tail = 0U;
-    rs485_set_tx(0U);
-    HAL_UART_Receive_IT(&huart2, &s_rx_byte, 1U);
+    s_tx_buf = NULL;
+    s_tx_len = 0U;
+    s_tx_pos = 0U;
+
+    /* 按 0x0090 枚举查表重配 USART6（对齐 running UartTask_Entry 第 3 步）。
+     * 必须放在 retentive_load_params() 之后、开接收中断之前 ——
+     * 若在 HAL_UART_Init 之前就开了 RXNE，重配过程中会收到脏字节。
+     * 改动下次断电重启生效（与 running 语义一致）。 */
+    const uart_cfg_t *cfg = uart_cfg_lookup(s_holding_regs[REG_PARAM_UART_CFG]);
+    MX_USART6_RS485_UART_Init_With(cfg->baud, cfg->parity);
+
+    /* 接收中断由我们自管（不经过 HAL），先确保 RXNE/TC/TXE 都关，清残留标志，
+     * 再打开 RXNE 开始接收。HAL_UART_Init 内部已配好波特率/帧格式，此处只管中断。 */
+    CLEAR_BIT(USART6->CR1, USART_CR1_RXNEIE | USART_CR1_TXEIE | USART_CR1_TCIE);
+    rs485_rx_enable(1U);
 }
 
 void modbus_poll(void)
 {
     static uint8_t frame[64];
     static uint16_t frame_len = 0U;
+    static uint32_t last_rx_ms = 0U;
 
     retentive_poll();
     motor_can_poll_rx();
     motor_can_tick();
+
+    /* 上一帧响应若还在中断驱动发送中，先等它发完（最多 20ms）。
+     * 必要性：s_tx_buf 指向 static response[]，若不等发完就处理下一帧，
+     * 新响应会覆写同一块缓冲，正在移出的字节就变成脏数据。
+     * Modbus 是一问一答，正常情况下早就发完了，这里只是兜底。
+     * 发送周期 5ms，一帧 8~40 字节约 0.7~3.5ms @115200，20ms 上限绰绰有余。 */
+    (void)modbus_tx_wait_done(MODBUS_RTU_TIMEOUT_MS);
 
     /* 姿态前馈自动占空比：每轮 poll(5ms) 更新一次。
      * 放在 ModbusTask 而非 InsTask 的原因：
@@ -1178,6 +1413,9 @@ void modbus_poll(void)
     fan_auto_update();
     refresh_imu_registers();
 
+    /* 加热 PWM 是只读诊断量，每轮刷新（不参与参数区的读写） */
+    s_holding_regs[REG_AUTO_HEATER_PWM] = ins_get_heater_pwm();
+
     while (ring_len() > 0U)
     {
         uint8_t byte = 0U;
@@ -1186,6 +1424,7 @@ void modbus_poll(void)
             break;
         }
         frame[frame_len++] = byte;
+        last_rx_ms = HAL_GetTick();
 
         if (frame_len >= sizeof(frame))
         {
@@ -1211,7 +1450,10 @@ void modbus_poll(void)
                     uint16_t crc_expected = (uint16_t)((uint16_t)frame[total_len - 2U] | ((uint16_t)frame[total_len - 1U] << 8U));
                     if (crc_actual == crc_expected)
                     {
-                        uint8_t response[128];
+                        /* response 必须是 static：modbus_send_frame 走中断驱动发送，
+                         * 函数返回后若响应还在栈上就会被后续函数调用覆盖。
+                         * 同一时刻只有一帧在发（Modbus 一问一答），无需加锁。 */
+                        static uint8_t response[128];
                         uint16_t response_len = process_request(frame, total_len, response);
                         if (response_len > 0U)
                         {
@@ -1221,48 +1463,91 @@ void modbus_poll(void)
                         frame_len = 0U;
                         continue;
                     }
-                    /* CRC mismatch: drop first byte and keep newest stream */
-                    memmove(frame, frame + 1U, frame_len - 1U);
-                    frame_len--;
+
+                    /* CRC 校验失败：说明这一帧从一开始就错位了（多了/少了字节，
+                     * 或掺进了脏数据）。旧实现只丢 1 个首字节然后立刻重判，
+                     * 在"持续错位"时（如首字节丢失导致后续全部左移）会一直错下去，
+                     * 永远解不出帧，表现就是上位机持续报 Insufficient bytes received。
+                     *
+                     * 改为**整帧丢弃**：Modbus RTU 靠 3.5 字符静默间隔分帧，
+                     * 下一帧到来时天然是干净的，重新同步最省事也最可靠。
+                     * 注意：丢弃后下面 while 会继续 pop，但 frame_len 已归零，
+                     * 相当于把当前残余全部当作无效数据抛掉。 */
+                    memset(frame, 0, sizeof(frame));
+                    frame_len = 0U;
                     continue;
                 }
             }
         }
     }
+
+    /* 帧间静默超时（Modbus RTU 的 3.5 字符间隔）。
+     * 115200 8N1 下一个字符约 87us，3.5 字符 ≈ 305us；取 4ms 留足余量，
+     * 远小于 Modbus Poll 默认 1000ms 的扫描周期，不会误切正常帧。
+     *
+     * 为什么必须加：轮询周期 5ms，一帧 8 字节传输只要约 0.7ms。
+     * 若上一帧因干扰残缺（如只收到 3 字节就断了），残余会一直留在 frame 里，
+     * 等下一次请求到来时与前半截拼在一起 → frame[1] 不再是功能码 → 永远 CRC 错。
+     * 有了超时，残缺帧会在下一次请求到来之前被清掉。 */
+    if ((frame_len > 0U) && ((HAL_GetTick() - last_rx_ms) > MODBUS_FRAME_GAP_MS))
+    {
+        memset(frame, 0, sizeof(frame));
+        frame_len = 0U;
+    }
 }
 
+/* RX 帧处理：从队列取帧，在任务上下文更新寄存器（与 running CanTask 的 RX 分支一致）。
+ * 中断回调只负责"把帧搬进队列"，不碰寄存器 —— 这样避免中断里长时间持锁，
+ * 也保证 s_holding_regs 只在任务上下文被写（Modbus 读写同任务，天然串行）。 */
 static void motor_can_poll_rx(void)
 {
-    while ((CAN1->RF0R & CAN_RF0R_FMP0) != 0U)
+    if (s_can_rx_queue == NULL)
     {
-        uint32_t rir = CAN1->sFIFOMailBox[0].RIR;
-        uint32_t std_id = (rir >> 21U) & 0x7FFU;
-        uint8_t dlc = (uint8_t)(CAN1->sFIFOMailBox[0].RDTR & 0x0FU);
-        uint8_t rx_data[8] = {0};
+        return;
+    }
 
-        rx_data[0] = (uint8_t)(CAN1->sFIFOMailBox[0].RDLR & 0xFFU);
-        rx_data[1] = (uint8_t)((CAN1->sFIFOMailBox[0].RDLR >> 8U) & 0xFFU);
-        rx_data[2] = (uint8_t)((CAN1->sFIFOMailBox[0].RDLR >> 16U) & 0xFFU);
-        rx_data[3] = (uint8_t)((CAN1->sFIFOMailBox[0].RDLR >> 24U) & 0xFFU);
-        rx_data[4] = (uint8_t)(CAN1->sFIFOMailBox[0].RDHR & 0xFFU);
-        rx_data[5] = (uint8_t)((CAN1->sFIFOMailBox[0].RDHR >> 8U) & 0xFFU);
-        rx_data[6] = (uint8_t)((CAN1->sFIFOMailBox[0].RDHR >> 16U) & 0xFFU);
-        rx_data[7] = (uint8_t)((CAN1->sFIFOMailBox[0].RDHR >> 24U) & 0xFFU);
-
-        if (dlc > 8U)
-        {
-            dlc = 8U;
-        }
-        motor_status_update_from_can(std_id, rx_data, dlc);
-        CAN1->RF0R |= CAN_RF0R_RFOM0;
+    CanRxMsg_t rx;
+    while (xQueueReceive(s_can_rx_queue, &rx, 0U) == pdPASS)
+    {
+        motor_status_update_from_can(rx.id, rx.data, rx.dlc);
     }
 }
 
-void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+/* CAN RX0 中断回调（由 HAL 在 CAN1_RX0_IRQHandler → HAL_CAN_IRQHandler 中调用）。
+ * 与 running freertos.c:515 一致：**只把帧搬进队列**，寄存器写入留给任务上下文。
+ * 队列未就绪（调度器启动前）直接丢弃，避免空指针。 */
+void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
 {
-    if (huart->Instance == USART2)
+    if ((hcan->Instance != CAN1) || (s_can_rx_queue == NULL))
     {
-        ring_push(s_rx_byte);
-        HAL_UART_Receive_IT(&huart2, &s_rx_byte, 1U);
+        return;
+    }
+
+    CanRxMsg_t msg;
+    CAN_RxHeaderTypeDef hdr;
+    if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &hdr, msg.data) == HAL_OK)
+    {
+        msg.id  = hdr.StdId;
+        msg.dlc = (uint8_t)hdr.DLC;
+        BaseType_t higher_woken = pdFALSE;
+        (void)xQueueSendFromISR(s_can_rx_queue, &msg, &higher_woken);
+        portYIELD_FROM_ISR(higher_woken);
     }
 }
+
+/* CAN1_RX0 中断服务入口，供 Src/stm32f4xx_it.c 调用。
+ * 走 HAL，与 running 一致（running 的 CanTask 用 HAL_CAN_ActivateNotification）。 */
+void motor_can_irq_handler(void)
+{
+    HAL_CAN_IRQHandler(&hcan1);
+}
+
+/* 说明：本工程 RS485 收发**不使用 HAL UART 中断状态机**，
+ * 因此没有 HAL_UART_RxCpltCallback / HAL_UART_ErrorCallback。
+ * 取而代之的是下方 usart6_irq_handler()——在 USART6 中断里直接读 SR/DR，
+ * 每次中断都顺手清 ORE/FE/NE/PE。这样从架构上就不存在
+ * "HAL 关掉 RXNE 中断后接收永久停摆"的可能，与 running 的 portserial.c 一致。
+ *
+ * 历史教训（2026-09-10）：曾用 HAL_UART_Receive_IT 逐字节接收 + 补 HAL_UART_ErrorCallback
+ * 的方式打补丁，但根子在于 HAL 状态机本身脆弱，故整体改为裸寄存器方案。 */
+

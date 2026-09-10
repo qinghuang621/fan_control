@@ -34,15 +34,37 @@
 - 风机 3 和 4 共用 PWM7（取两者较大占空比输出），逻辑编号仍是 1/2/3/4。
 - FG 输入使用 STM32 内部上拉（`GPIO_PULLUP`），适合 FG/开集电极型信号；输入必须兼容 3.3V，5V 信号需电平转换。
 
-### 2.2 RS485 接线（USART2）
+### 2.2 RS485 接线（USART6 / 外壳丝印 UART1 的 3-Pin 口）
 
 | 信号     | 引脚 | 说明                            |
 |----------|------|---------------------------------|
-| RS485_TX | PA2  | USART2 TX → SP3485 DI           |
-| RS485_RX | PA3  | USART2 RX ← SP3485 RO           |
-| RS485_RE/DE | PG8 | 高=发送，低=接收（方向控制）    |
+| RS485_TX | PG14 | USART6 TX（AF8）→ 模块 RXD/DI   |
+| RS485_RX | PG9  | USART6 RX（AF8）← 模块 TXD/RO   |
+| RS485_RE/DE | PG8 | 高=发送，低=接收（方向控制，需从板内另引） |
+
+接口：C 板外壳丝印的 **UART1（3-Pin）**，脚序 `GND - TXD - RXD`。
+
+> ⚠️ **C 板丝印与 MCU 外设交叉错位**（官方手册原文）：
+> "开发板的外壳丝印（UART1 与 UART2）与 STM32 的实际串口配置并不对应，
+> **外壳丝印 UART1 对应 STM32 的 UART6，外壳丝印 UART2 对应 STM32 的 UART1**。"
+>
+> | 外壳丝印 | 实际 MCU 外设 | 引脚 | 脚序 | 供电 |
+> |---|---|---|---|---|
+> | UART1 (3-Pin) | **USART6** | PG14 / PG9 | GND-TXD-RXD | 无 |
+> | UART2 (4-Pin) | USART1 | PA9 / PB7 | RXD-TXD-GND-5V | 5V |
+>
+> **3-Pin 口没有电源脚**，TTL-RS485 模块需另找 5V/3.3V 供电。
 
 默认串口参数：**115200, 8N1**，从站地址 **1**（可由寄存器 `0x0091` 改为 1~247，写 0 或 >247 回退 1）。
+波特率/校验可由寄存器 `0x0090` 枚举改（8 种组合，见接口文档 §7.2），上电读一次，复位生效。
+
+> 历史：早期版本走 USART2（PA2/PA3）；后短暂改为 USART1（4-Pin 口）；最终确定用 3-Pin 口，
+> MCU 侧为 USART6。
+
+> **RS485 收发实现（2026-09-10 起对齐 running）**：**不使用 HAL UART 中断状态机**，
+> 而是在 `USART6_IRQHandler` 里裸寄存器自管：RXNE 读 DR 入环形 FIFO、**每次中断都清 ORE/FE/NE/PE**、
+> TXE 逐字节发送、**TC 中断才切回接收方向**（PG8）。这样从架构上消除了
+> "HAL 逐字节接收遇 ORE 溢出后永久停摆"与"发送未移完就拉低方向脚截断末字节"两个隐患。
 
 ### 2.3 CAN1 总线
 
@@ -51,7 +73,13 @@
 | CAN_TX| PD1  | CAN1 TX，AF9                    |
 | CAN_RX| PD0  | CAN1 RX，AF9                    |
 
-波特率：**1 Mbps**，位时间 14 TQ（BRP=2，TS1=11TQ，TS2=2TQ，SJW=1TQ，采样点 85.7%）。NART 开启（`CAN_MCR_NART`），避免总线无应答时一直重发占满三个邮箱。
+波特率：**1 Mbps**，位时间 14 TQ（BRP=2，TS1=11TQ，TS2=2TQ，SJW=1TQ，采样点 85.7%）。
+**自动重传开启**（`AutoRetransmission = ENABLE`，对齐 running），偶发错误帧能自动补发；
+总线无应答时会占满三个邮箱，由发送函数"邮箱满 → 逐个 `HAL_CAN_AbortTxRequest`"兜底。
+
+收发走 **HAL API + 中断队列**（对齐 running）：`HAL_CAN_AddTxMessage` 发送，
+`CAN1_RX0` 中断里 `HAL_CAN_RxFifo0MsgPendingCallback` **只把帧写入 FreeRTOS 队列**，
+寄存器更新在任务上下文完成。
 
 > **重要**：早期版本曾把 CAN1 配到 PA11/PA12，那两个脚实际是 USB_OTG_FS_DM/DP。**C 板的 CAN1 在 PD0/PD1**，以 RoboMaster C 板用户手册为准。
 
@@ -63,7 +91,7 @@
 
 | 任务 | 周期 | 优先级 | 职责 |
 |------|------|--------|------|
-| ModbusTask | 5 ms | +4 | RS485 帧解析、Modbus 03/06/10/04 协议、CAN 电机发送、FIFO 接收、心跳超时、参数落盘 |
+| ModbusTask | 5 ms | +4 | RS485 帧解析（裸寄存器中断收发）、Modbus 03/06/10/04 协议、CAN 电机发送（HAL API）、CAN 接收队列排空、心跳超时、参数落盘 |
 | FanTask    | 5 ms | +3 | 风机占空比斜坡、PWM 输出更新 |
 | PulseTask  | 10 ms| +2 | 500 ms 窗口 FG 测频、RPM 计算 |
 | LedTask    | 5 ms | +1 | RGB 倾斜指示灯（色相=倾斜方向，饱和度=幅度，亮度=系统状态） |
