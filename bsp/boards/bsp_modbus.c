@@ -14,7 +14,14 @@
 
 #define MODBUS_SLAVE_ADDR 0x01U
 #define MODBUS_RX_RING_SIZE 128U
-#define MODBUS_REG_COUNT 256U
+/* 保持寄存器总数。
+ * 0x0000~0x00BF 与 running（Core/Inc/registers.h, REG_HOLDING_COUNT=256）逐地址一致：
+ *   0x0000~0x003F 控制区 / 0x0040~0x008F CAN 电机状态 / 0x0090~0x00BF 参数区
+ * 0x00C0~0x00FF 为 running 的保留区，本工程同样留空。
+ * 0x0100 起是本工程后加的风机区，必须扩到 512 才落得下——
+ * 若仍是 256，风机占空比 0x0100 会被下面的 addr >= MODBUS_REG_COUNT 直接拒绝，
+ * 表现是上位机写 40257~40260 静默无效。 */
+#define MODBUS_REG_COUNT 512U
 #define MODBUS_RTU_TIMEOUT_MS 20U
 
 #define FLASH_RETENTIVE_A_ADDR 0x080C0000UL
@@ -44,6 +51,15 @@
 #define REG_MOTOR_STATUS_M4 0x0082U
 #define REG_MOTOR_STATUS_STRIDE 10U
 #define REG_MOTOR_TX_ID_BASE 0x201U
+
+/* 达妙速度模式（SPD_MODE = 0x200）下，使能/失能/清错/速度四类命令共用同一个
+ * CAN ID = 0x200 + 电机ID = 0x201~0x204，靠数据域的最后一字节区分（FC/FD/FB）。
+ * 与 running 的 c_cmdEnable/c_cmdDisable/c_cmdClearErr 一致（Core/Src/freertos.c:83），
+ * 取自厂家 Doc/dm_motor_drv.c 的 enable_motor_mode() / disable_motor_mode()。 */
+static const uint8_t c_cmd_enable[8]    = {0xFFU, 0xFFU, 0xFFU, 0xFFU, 0xFFU, 0xFFU, 0xFFU, 0xFCU};
+static const uint8_t c_cmd_disable[8]   = {0xFFU, 0xFFU, 0xFFU, 0xFFU, 0xFFU, 0xFFU, 0xFFU, 0xFDU};
+static const uint8_t c_cmd_clear_err[8] = {0xFFU, 0xFFU, 0xFFU, 0xFFU, 0xFFU, 0xFFU, 0xFFU, 0xFBU};
+
 #define REG_MOTOR_COUNT 4U
 #define REG_MOTOR_W_MAX 30.0f
 #define REG_MOTOR_LX 0.15f
@@ -54,6 +70,11 @@
 #define MOTOR_CAN_TX_WAIT_TICKS 5U
 #define REG_FAN_DUTY_BASE 0x0100U
 #define REG_FAN_CNT 4U
+/* 风机状态区：本工程后加，独立放在 0x0110 起，**不得**占用 running 的电机状态区
+ * （0x0064/0x006E/0x0078/0x0082）。每台风機 10 个寄存器，布局沿用电机状态语义：
+ * +0 ERR / +1 保留 / +2+3 POS / +4+5 VEL / +6+7 T / +8 T_MOS / +9 T_Rotor */
+#define REG_FAN_STATUS_BASE 0x0110U
+#define REG_FAN_STATUS_STRIDE 10U
 #define REG_CAN_STATUS_BASE 0x0040U
 #define REG_CAN_STATUS_END 0x008FU
 #define REG_STATUS_STRIDE 10U
@@ -224,26 +245,21 @@ static uint8_t get_modbus_slave_addr(void)
 
 static void refresh_fan_state_registers(void)
 {
-    const uint16_t motor_status_base[REG_FAN_CNT] = {
-        REG_MOTOR_STATUS_M1,
-        REG_MOTOR_STATUS_M2,
-        REG_MOTOR_STATUS_M3,
-        REG_MOTOR_STATUS_M4
-    };
-
     for (uint16_t i = 0U; i < REG_FAN_CNT; ++i)
     {
-        uint16_t status_base = motor_status_base[i];
+        /* 风机状态写自己的区段，绝不碰电机状态区（running 地址 0x0064 起） */
+        uint16_t status_base = (uint16_t)(REG_FAN_STATUS_BASE + i * REG_FAN_STATUS_STRIDE);
         uint16_t duty = clamp_duty(s_holding_regs[REG_FAN_DUTY_BASE + i]);
         uint32_t rpm = pulse_get_rpm((uint8_t)(i + 1U), 2U);
         uint32_t pulse_cnt = pulse_get_pulse_count((uint8_t)(i + 1U));
 
-        /* keep running 项目定义的状态布局：
-         * +0 ERR    : 运行状态/错误码（这里用 0/1 展示使能状态）
+        /* 字段布局沿用与电机状态区相同的 10 寄存器格式（上位机可复用解析），
+         * 但地址在风机独立区 0x0110 起，与 running 的电机状态区 0x0064 起互不重叠：
+         * +0 ERR    : 运行标志（占空比 > 0 为 1）
          * +1 保留   : 0
-         * +2/+3 POS : 浮点位置反馈（采用 pulse count 近似）
-         * +4/+5 VEL : 浮点速度反馈（RPM）
-         * +6/+7 T   : 浮点扭矩估计（占空比）
+         * +2/+3 POS : FG 脉冲累计计数
+         * +4/+5 VEL : 实测转速 RPM
+         * +6/+7 T   : 当前输出占空比 0~100
          * +8 T_MOS  : 估算 MOS 温度
          * +9 T_Rotor: 估算转子温度
          */
@@ -638,33 +654,42 @@ static uint8_t motor_can_send_frame(uint32_t std_id, const uint8_t *data, uint8_
 
 static void motor_can_send_speed(uint16_t motor_index, float speed)
 {
-    uint8_t payload[8] = {0};
     union
     {
         float f;
-        uint32_t u32;
-    } conv;
+        uint8_t b[4];
+    } u;
 
-    conv.f = speed;
-    payload[0] = (uint8_t)(conv.u32 & 0xFFU);
-    payload[1] = (uint8_t)((conv.u32 >> 8U) & 0xFFU);
-    payload[2] = (uint8_t)((conv.u32 >> 16U) & 0xFFU);
-    payload[3] = (uint8_t)((conv.u32 >> 24U) & 0xFFU);
-    payload[4] = 0U;
-    payload[5] = 0U;
-    payload[6] = 0U;
-    payload[7] = 0U;
-    motor_can_send_frame((uint32_t)(0x201U + motor_index), payload, 8U);
+    u.f = speed;
+    /* 与 running CanTask_WriteFloat() 一致：厂家 spd_ctrl 为 4 字节小端 float，DLC=4。
+     * 旧实现填 8 字节（后 4 字节补 0），DLC 冗余，已对齐 running。 */
+    motor_can_send_frame((uint32_t)(REG_MOTOR_TX_ID_BASE + motor_index), u.b, 4U);
 }
 
 static void motor_can_tick(void)
 {
     static uint32_t last_tick_ms = 0U;
+    /* 使能/清错寄存器上一次的值：首次调用时从寄存器初值读取，避免上电误触发边沿。
+     * 与 running CanTask 一致（Core/Src/freertos.c:341）。 */
+    static uint16_t en_prev[REG_MOTOR_COUNT];
+    static uint16_t clr_prev[REG_MOTOR_COUNT];
+    static uint8_t edge_init_done = 0U;
+
     if ((HAL_GetTick() - last_tick_ms) < 10U)
     {
         return;
     }
     last_tick_ms = HAL_GetTick();
+
+    if (edge_init_done == 0U)
+    {
+        for (uint16_t i = 0U; i < REG_MOTOR_COUNT; ++i)
+        {
+            en_prev[i] = s_holding_regs[REG_MOTOR_EN_BASE + i];
+            clr_prev[i] = s_holding_regs[REG_MOTOR_CLR_BASE + i];
+        }
+        edge_init_done = 1U;
+    }
 
     /* 与 running CanTask 一致：发速度命令前先做运动学解算 */
     motor_kinematics_resolve();
@@ -674,53 +699,97 @@ static void motor_can_tick(void)
         uint16_t enable_addr = (uint16_t)(REG_MOTOR_EN_BASE + i);
         uint16_t clear_addr = (uint16_t)(REG_MOTOR_CLR_BASE + i);
         float speed = read_float32_regs(s_holding_regs, (uint16_t)(REG_MOTOR_VEL_BASE + i * 2U));
+        uint16_t en = s_holding_regs[enable_addr];
+        uint16_t clr = s_holding_regs[clear_addr];
 
-        if (s_holding_regs[enable_addr] != 0U)
+        /* 使能边沿检测：0->非0 发使能，非0->0 发失能（与 running 一致）。
+         * 旧实现是"电平触发 + 数据格式错"：使能寄存器非 0 时每 10ms 重复发
+         * {i, 0x01, 0...}，电机在速度模式下会把前 4 字节当 float 解析成
+         * 一个"速度≈0"的命令，真正的使能命令从未发出过，电机不会转。 */
+        if (en != en_prev[i])
         {
-            uint8_t payload[8] = {0U};
-            payload[0] = (uint8_t)i;
-            payload[1] = 0x01U;
-            motor_can_send_frame((uint32_t)(0x200U + i + 1U), payload, 8U);
+            if (en != 0U)
+            {
+                motor_can_send_frame((uint32_t)(REG_MOTOR_TX_ID_BASE + i), c_cmd_enable, 8U);
+            }
+            else
+            {
+                motor_can_send_frame((uint32_t)(REG_MOTOR_TX_ID_BASE + i), c_cmd_disable, 8U);
+            }
+            en_prev[i] = en;
         }
 
-        if (s_holding_regs[clear_addr] != 0U)
+        /* 清错边沿检测：仅 0->非0 上升沿发一次（与 running 一致）。
+         * 注：旧实现发完后会把寄存器自动清零，running 不做清零，已对齐 running。 */
+        if (clr != clr_prev[i])
         {
-            uint8_t payload[8] = {0U};
-            payload[0] = (uint8_t)i;
-            payload[1] = 0x02U;
-            motor_can_send_frame((uint32_t)(0x200U + i + 1U), payload, 8U);
-            s_holding_regs[clear_addr] = 0U;
+            if (clr != 0U)
+            {
+                motor_can_send_frame((uint32_t)(REG_MOTOR_TX_ID_BASE + i), c_cmd_clear_err, 8U);
+            }
+            clr_prev[i] = clr;
         }
 
         motor_can_send_speed(i, speed);
     }
 }
 
-static void motor_status_update_from_can(uint32_t std_id, const uint8_t *data)
+/* ===== 电机状态帧解析：与 running Core/Src/freertos.c CanTask 的 RX 分支一致 =====
+ * 满量程取值来自 running freertos.c:116-118 */
+#define MOTOR_PMAX 12.5f   /* 位置 [-12.5, 12.5]，16 位定点 */
+#define MOTOR_VMAX 200.0f  /* 速度 [-200, 200]，12 位定点 */
+#define MOTOR_TMAX 10.0f   /* 扭矩 [-10, 10]，12 位定点 */
+
+/* 无符号定点整数线性映射到 [x_min, x_max]（厂家 uint_to_float 原样移植） */
+static float uint_to_float(int x_int, float x_min, float x_max, int bits)
 {
-    if (std_id < 0x201U || std_id > 0x204U)
+    float span = x_max - x_min;
+    float offset = x_min;
+    return ((float)x_int) * span / ((float)((1 << bits) - 1)) + offset;
+}
+
+/* 达妙电机状态上报帧：
+ *   CAN ID = 0、DLC = 8（其余 ID 一律丢弃，避免污染电机状态区）
+ *   data[0] 低 4 位 = 电机号 1~4，高 4 位 = 错误码
+ *   data[1]:data[2]              POS 16 位定点
+ *   data[3]:data[4] 高 4 位      VEL 12 位定点
+ *   data[4] 低 4 位:data[5]      T   12 位定点
+ *   data[6] T_MOS   data[7] T_Rotor
+ */
+static void motor_status_update_from_can(uint32_t std_id, const uint8_t *data, uint8_t dlc)
+{
+    if ((std_id != 0U) || (dlc < 8U))
     {
         return;
     }
 
-    uint16_t motor_index = (uint16_t)(std_id - 0x201U);
-    uint16_t status_base = (uint16_t)(REG_MOTOR_STATUS_M1 + motor_index * REG_MOTOR_STATUS_STRIDE);
-    union
+    uint8_t motor_id = (uint8_t)(data[0] & 0x0FU);
+    uint8_t err = (uint8_t)((data[0] >> 4U) & 0x0FU);
+    if ((motor_id < 1U) || (motor_id > REG_MOTOR_COUNT))
     {
-        float f;
-        uint32_t u32;
-    } conv;
-
-    if (data[0] != 0U)
-    {
-        s_holding_regs[status_base + 0U] = (uint16_t)data[0];
+        return;
     }
-    s_holding_regs[status_base + 1U] = 0U;
 
-    conv.u32 = (uint32_t)data[4U] << 24U | (uint32_t)data[5U] << 16U | (uint32_t)data[6U] << 8U | (uint32_t)data[7U];
-    write_float32_regs(s_holding_regs, status_base + 2U, conv.f);
-    conv.u32 = (uint32_t)data[0U] << 24U | (uint32_t)data[1U] << 16U | (uint32_t)data[2U] << 8U | (uint32_t)data[3U];
-    write_float32_regs(s_holding_regs, status_base + 4U, conv.f);
+    uint16_t m = (uint16_t)(motor_id - 1U);
+    uint16_t base = (uint16_t)(REG_MOTOR_STATUS_M1 + m * REG_MOTOR_STATUS_STRIDE);
+
+    s_holding_regs[base + 0U] = (uint16_t)err;
+    s_holding_regs[base + 1U] = 0U;
+
+    uint16_t pos_raw = (uint16_t)(((uint16_t)data[1] << 8U) | (uint16_t)data[2]);
+    write_float32_regs(s_holding_regs, base + 2U,
+                       uint_to_float((int)pos_raw, -MOTOR_PMAX, MOTOR_PMAX, 16));
+
+    uint16_t vel_raw = (uint16_t)(((uint16_t)data[3] << 4U) | (uint16_t)(data[4] >> 4U));
+    write_float32_regs(s_holding_regs, base + 4U,
+                       uint_to_float((int)vel_raw, -MOTOR_VMAX, MOTOR_VMAX, 12));
+
+    uint16_t t_raw = (uint16_t)(((uint16_t)(data[4] & 0x0FU) << 8U) | (uint16_t)data[5]);
+    write_float32_regs(s_holding_regs, base + 6U,
+                       uint_to_float((int)t_raw, -MOTOR_TMAX, MOTOR_TMAX, 12));
+
+    s_holding_regs[base + 8U] = (uint16_t)data[6];
+    s_holding_regs[base + 9U] = (uint16_t)data[7];
 }
 
 static void modbus_write_single_register(uint16_t addr, uint16_t value)
@@ -975,7 +1044,7 @@ static void motor_can_poll_rx(void)
         {
             dlc = 8U;
         }
-        motor_status_update_from_can(std_id, rx_data);
+        motor_status_update_from_can(std_id, rx_data, dlc);
         CAN1->RF0R |= CAN_RF0R_RFOM0;
     }
 }
