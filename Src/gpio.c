@@ -40,11 +40,65 @@
 void MX_GPIO_Init(void)
 {
 
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
   __HAL_RCC_GPIOC_CLK_ENABLE();
-  __HAL_RCC_GPIOH_CLK_ENABLE();
   __HAL_RCC_GPIOE_CLK_ENABLE();
+  __HAL_RCC_GPIOF_CLK_ENABLE();
+  __HAL_RCC_GPIOG_CLK_ENABLE();
+  __HAL_RCC_GPIOH_CLK_ENABLE();
+
+  /* USER CODE BEGIN MX_GPIO_Init_1 */
+
+  /* BMI088 使用 PB3(SPI1_SCK) / PB4(SPI1_MISO)。
+   * 这两个脚上电默认复用为 JTAG 的 JTDO/NJTRST，但在 STM32F4 上，
+   * 只要在 HAL_SPI_MspInit 里把 AFR 配成 GPIO_AF5_SPI1，硬件即自动切换为 SPI 功能，
+   * **不需要** F1 那套 AFIO_MAPR 的 SWJ_CFG 重映射（那是 F1 独有的寄存器）。
+   * 注意：此处绝不能调用 JTAGDISABLE 类操作，否则会连 SWD 一起关掉，下载器将失联。 */
+
+  /* USER CODE END MX_GPIO_Init_1 */
+
+  /*Configure GPIO pin Output Level --------------------------------------------*/
+  /* BMI088 两路片选默认拉高（空闲态），避免上电瞬间误选中从机 */
+  HAL_GPIO_WritePin(CS1_ACCEL_GPIO_Port, CS1_ACCEL_Pin, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(CS1_GYRO_GPIO_Port,  CS1_GYRO_Pin,  GPIO_PIN_SET);
+
+  /*Configure GPIO pins : CS1_ACCEL_Pin CS1_GYRO_Pin ---------------------------*/
+  GPIO_InitStruct.Pin   = CS1_ACCEL_Pin;
+  GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull  = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+  HAL_GPIO_Init(CS1_ACCEL_GPIO_Port, &GPIO_InitStruct);
+
+  GPIO_InitStruct.Pin = CS1_GYRO_Pin;
+  HAL_GPIO_Init(CS1_GYRO_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : INT1_ACCEL_Pin INT1_GYRO_Pin -------------------------*/
+  /* 陀螺/加速度计的数据就绪中断，下降沿有效，内部上拉 */
+  GPIO_InitStruct.Pin  = INT1_ACCEL_Pin | INT1_GYRO_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+  /* EXTI interrupt init -------------------------------------------------------*/
+  /* ⚠️ 这两个中断是**采集链路的唯一触发器**，必须使能！
+   * BMI088 每完成一次转换就拉低对应 INT1 引脚，中断里才发起 SPI1 DMA。
+   * 若这里不使能，DMA 永远不会被启动，姿态角将恒为 0。 */
+  HAL_NVIC_SetPriority(INT1_ACCEL_EXTI_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(INT1_ACCEL_EXTI_IRQn);
+
+  HAL_NVIC_SetPriority(INT1_GYRO_EXTI_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(INT1_GYRO_EXTI_IRQn);
+
+  /* EXTI0 软中断：由 SPI1 DMA 接收完成中断里 __HAL_GPIO_EXTI_GENERATE_SWIT(GPIO_PIN_0)
+   * 软件触发，用于把 InsTask 从 ulTaskNotifyTake 中唤醒。
+   * 优先级 6：数值比 DMA 的 5 大 = 优先级更低，保证 DMA 链路先跑完。
+   * EXTI0 对应 PA0，本工程 PA0 未接外设，纯软件触发，无冲突。 */
+  HAL_NVIC_SetPriority(EXTI0_IRQn, 6, 0);
+  HAL_NVIC_EnableIRQ(EXTI0_IRQn);
 
 }
 

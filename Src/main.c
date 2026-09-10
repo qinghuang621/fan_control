@@ -26,6 +26,7 @@
 #include "tim.h"
 #include "usart.h"
 #include "gpio.h"
+#include "spi.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -33,6 +34,7 @@
 #include "bsp_led.h"
 #include "bsp_modbus.h"
 #include "bsp_pulse.h"
+#include "ins_task.h"
 
 /* USER CODE END Includes */
 
@@ -66,7 +68,6 @@ static void LedTask_Entry(void *argument);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
-
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
@@ -174,6 +175,8 @@ int main(void)
   MX_USART3_UART_Init();
   MX_TIM8_Init();
   MX_TIM1_Init();
+  MX_SPI1_Init();
+  MX_TIM10_Init();
   /* USB CDC 已废弃：CAN1 占用 PD0/PD1，且不再使用虚拟串口调试 */
   /* USER CODE BEGIN 2 */
 
@@ -196,6 +199,16 @@ int main(void)
     /* 初始化 RS485 Modbus RTU 从站 */
     modbus_init();
 
+    /* BMI088 恒温加热 PWM（TIM10 CH1 / PF6）先启动，占空比由 InsTask 的 PID 接管 */
+    HAL_TIM_PWM_Start(&htim10, TIM_CHANNEL_1);
+
+    /* 任务优先级说明（tskIDLE_PRIORITY = 0）：
+     *   ModbusTask +4  最高 —— RS485 通信超时敏感，且 CAN 发送跑在这里
+     *   FanTask    +3     风机输出
+     *   InsTask    +3     与 FanTask 同级：姿态解算是风机占空比的前馈来源，
+     *                     但 1kHz 解算本身不紧缺 CPU，同级轮转已足够
+     *   PulseTask  +2     FG 脉冲统计
+     *   LedTask    +1     最低 —— 纯装饰，被抢占无影响 */
     if (xTaskCreate(FanTask_Entry, "FanTask", 256U, NULL, tskIDLE_PRIORITY + 3U, NULL) != pdPASS)
     {
         Error_Handler();
@@ -209,6 +222,12 @@ int main(void)
         Error_Handler();
     }
     if (xTaskCreate(LedTask_Entry, "LedTask", 256U, NULL, tskIDLE_PRIORITY + 1U, NULL) != pdPASS)
+    {
+        Error_Handler();
+    }
+    /* InsTask 栈需放大：内部有 mahony（含 sqrt/atan2 浮点库调用）、PID、
+     * 以及 seqlock 快照临时结构，256 字（1KB）偏紧。 */
+    if (xTaskCreate(InsTask_Entry, "InsTask", 512U, NULL, tskIDLE_PRIORITY + 3U, NULL) != pdPASS)
     {
         Error_Handler();
     }

@@ -55,7 +55,7 @@ void UsageFault_Handler(void);
 void DebugMon_Handler(void);
 void SysTick_Handler(void);
 void DMA1_Stream1_IRQHandler(void);
-void OTG_FS_IRQHandler(void);
+/* DMA2_Stream2/3、EXTI0/4/9_5 的声明放在 components/algorithm/ins_task.h */
 /* USER CODE BEGIN EFP */
 
 /* USER CODE END EFP */

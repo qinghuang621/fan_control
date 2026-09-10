@@ -5,12 +5,14 @@
 #include "usart.h"
 #include "bsp_fric.h"
 #include "bsp_pulse.h"
+#include "ins_task.h"
 
 /* CAN 发送等待邮箱时需要 vTaskDelay() 让出 CPU，见 motor_can_send_frame() */
 #include "FreeRTOS.h"
 #include "task.h"
 
 #include <string.h>
+#include <math.h>
 
 #define MODBUS_SLAVE_ADDR 0x01U
 #define MODBUS_RX_RING_SIZE 128U
@@ -82,6 +84,45 @@ static const uint8_t c_cmd_clear_err[8] = {0xFFU, 0xFFU, 0xFFU, 0xFFU, 0xFFU, 0x
 #define REG_PARAM_END 0x00BFU
 #define REG_PARAM_UART_CFG 0x0090U
 #define REG_PARAM_SLAVE_ADDR 0x0091U
+
+/* ==================== 风机自动模式（姿态前馈）参数区 0x0140~0x014F ====================
+ * 风机占空比不再只由外部写 0x0100 决定，而是可以由 InsTask 依据 IMU 姿态自动生成。
+ * 控制律（重力分量补偿开环前馈）：
+ *     duty = DUTY_FLAT + SLOPE_GAIN * (1 - cos(theta))
+ * 其中 theta 由 roll/pitch 合成（见 fan_auto_tick）。物理含义：
+ * 斜面夹角越大，重力沿坡分量越大，需要更大吸附力防止打滑，故 duty 单调递增。
+ * 这些寄存器全部读写，支持上位机在线调参（便于现场"调试占空比曲线"）。 */
+#define REG_AUTO_BASE          0x0140U
+#define REG_AUTO_END           0x014FU
+#define REG_AUTO_FAN_MODE      0x0140U  /* 0=手动(跟随 0x0100) 1=自动(姿态前馈) */
+#define REG_AUTO_FAN_AUTO_EN   0x0141U  /* 自动模式总开关，0=强制手动 */
+#define REG_AUTO_DUTY_FLAT     0x0142U  /* 水平姿态基准占空比(%)，建议 >=30 */
+#define REG_AUTO_DUTY_MIN      0x0143U  /* 自动输出下限(%)，**必须 > 0**，建议 >=30 */
+#define REG_AUTO_DUTY_MAX      0x0144U  /* 自动输出上限(%) */
+#define REG_AUTO_SLOPE_GAIN    0x0145U  /* 坡度增益(每单位 (1-cosθ) 增加的占空比%) */
+#define REG_AUTO_KP_PITCH      0x0146U  /* 俯仰前馈增益（当前实现并入 SLOPE_GAIN，预留） */
+#define REG_AUTO_KP_ROLL       0x0147U  /* 横滚前馈增益（当前实现并入 SLOPE_GAIN，预留） */
+#define REG_AUTO_PITCH_OFFSET  0x0148U  /* 俯仰零位偏置(deg)，安装误差补偿 */
+#define REG_AUTO_ROLL_OFFSET   0x0149U  /* 横滚零位偏置(deg)，安装误差补偿 */
+#define REG_AUTO_MAG_ENABLE    0x014AU  /* 磁力计使能：本轮恒 0（只读，写无效） */
+#define REG_AUTO_MAG_STATUS    0x014BU  /* 磁力计状态：本轮恒 2=未接入（只读） */
+#define REG_AUTO_MAG_CAL_CMD   0x014CU  /* 磁校准命令：保留，本轮无实现 */
+#define REG_AUTO_HEATER_TARGET 0x014DU  /* 恒温目标温度(℃)，float32 需占 2 个寄存器到 0x014E */
+/* 0x014F 预留 */
+
+/* ==================== IMU 姿态输出区 0x0150~0x015F（只读） ====================
+ * 每个量为 float32，高字在前（与电机状态区同序），占 2 个寄存器。
+ * yaw 在六轴模式下会缓慢漂移，本轮仅作占位输出。 */
+#define REG_IMU_BASE           0x0150U
+#define REG_IMU_END            0x015FU
+#define REG_IMU_ROLL           0x0150U  /* deg */
+#define REG_IMU_PITCH          0x0152U  /* deg */
+#define REG_IMU_YAW            0x0154U  /* deg（六轴，会漂移，仅占位） */
+#define REG_IMU_GYRO_X         0x0156U  /* rad/s */
+#define REG_IMU_GYRO_Y         0x0158U  /* rad/s */
+#define REG_IMU_GYRO_Z         0x015AU  /* rad/s */
+#define REG_IMU_AUTO_DUTY      0x015CU  /* 自动模式下当前计算的占空比(%) */
+#define REG_IMU_STATUS         0x015EU  /* 0=离线 1=加热中 2=运行 3=错误 */
 
 static volatile uint8_t s_rx_ring[MODBUS_RX_RING_SIZE];
 static volatile uint16_t s_rx_head = 0U;
@@ -233,6 +274,18 @@ static uint8_t is_param_region(uint16_t addr)
     return (addr >= REG_PARAM_BASE) && (addr <= REG_PARAM_END);
 }
 
+static uint8_t is_auto_param_region(uint16_t addr)
+{
+    return (addr >= REG_AUTO_BASE) && (addr <= REG_AUTO_END);
+}
+
+/* IMU 姿态输出区为只读：上位机写这些地址一律静默忽略（不返回异常码，
+ * 保持与既有状态区 0x0040~0x008F 相同的"写无效但不报错"行为，便于上位机统一处理）。 */
+static uint8_t is_imu_status_region(uint16_t addr)
+{
+    return (addr >= REG_IMU_BASE) && (addr <= REG_IMU_END);
+}
+
 static uint8_t get_modbus_slave_addr(void)
 {
     uint16_t addr = s_holding_regs[REG_PARAM_SLAVE_ADDR];
@@ -284,6 +337,93 @@ static void sync_fan_outputs_from_regs(void)
     fric_set_channel_duty(2U, (uint8_t)fan2);
     fric_set_channel_duty(3U, (uint8_t)((fan3 > fan4) ? fan3 : fan4));
     refresh_fan_state_registers();
+}
+
+/* ==================== 姿态前馈自动占空比 ====================
+ * 控制律：duty = DUTY_FLAT + SLOPE_GAIN * (1 - cos(theta))
+ *
+ * 其中 theta 为车身相对水平面的总倾角，由 roll/pitch 合成：
+ *     cos(theta) = cos(pitch) * cos(roll)
+ * （两个方向的小角度旋转可解耦相乘，误差在 1% 量级内，对前馈足够）
+ *
+ * 为什么用 (1 - cosθ) 而不是 θ：
+ *   - 重力沿坡分量 ∝ sinθ，而吸附力需求增量与"损失的法向分量"∝ (1-cosθ) 同阶；
+ *   - (1-cosθ) 在 θ=0 处导数为 0，水平附近天然平滑，不会因姿态噪声抖动；
+ *   - 有界于 [0,1]，增益物理意义直观：SLOPE_GAIN 就是"竖直墙面时额外加多少点"。
+ *
+ * 注意：这是开环前馈，roll/pitch 的作用是"告知坡度"，不是闭环反馈。
+ *       实际吸附效果还需靠 DUTY_MIN 兜底 + 现场标定 SLOPE_GAIN。 */
+static uint16_t fan_auto_duty = 0U;
+
+static void fan_auto_update(void)
+{
+    ins_snapshot_t snap;
+    float roll_deg, pitch_deg;
+    float cos_theta;
+    float duty_f;
+    uint16_t duty_flat, duty_min, duty_max, slope_gain;
+    uint16_t out;
+
+    /* 只有"自动模式 + 总开关打开"才接管；否则沿用 0x0100 的手动值 */
+    if ((s_holding_regs[REG_AUTO_FAN_MODE] == 0U) ||
+        (s_holding_regs[REG_AUTO_FAN_AUTO_EN] == 0U))
+    {
+        fan_auto_duty = 0U;
+        return;
+    }
+
+    /* 读姿态快照：失败说明正在写，沿用上一轮结果，不阻塞 */
+    if (!INS_get_snapshot(&snap))
+    {
+        return;
+    }
+
+    duty_flat  = s_holding_regs[REG_AUTO_DUTY_FLAT];
+    duty_min   = s_holding_regs[REG_AUTO_DUTY_MIN];
+    duty_max   = s_holding_regs[REG_AUTO_DUTY_MAX];
+    slope_gain = s_holding_regs[REG_AUTO_SLOPE_GAIN];
+
+    /* 零位偏置：补偿 IMU 安装误差 */
+    pitch_deg = snap.pitch - (float)(int16_t)s_holding_regs[REG_AUTO_PITCH_OFFSET];
+    roll_deg  = snap.roll  - (float)(int16_t)s_holding_regs[REG_AUTO_ROLL_OFFSET];
+
+    /* 转弧度后合成总倾角余弦 */
+    cos_theta = cosf(pitch_deg * 0.017453292f) * cosf(roll_deg * 0.017453292f);
+
+    duty_f = (float)duty_flat + (float)slope_gain * (1.0f - cos_theta);
+
+    /* 下限兜底：吸附力绝不能为零 */
+    if (duty_f < (float)duty_min) duty_f = (float)duty_min;
+    if (duty_f > (float)duty_max) duty_f = (float)duty_max;
+    if (duty_f > 100.0f) duty_f = 100.0f;
+
+    out = (uint16_t)duty_f;
+    fan_auto_duty = out;
+
+    /* 四路同值：风机 3/4 共用 PWM7，不做分轴 */
+    fric_set_channel_duty(1U, (uint8_t)out);
+    fric_set_channel_duty(2U, (uint8_t)out);
+    fric_set_channel_duty(3U, (uint8_t)out);
+}
+
+/* 把姿态与自动占空比刷进 0x0150~0x015F 只读区 */
+static void refresh_imu_registers(void)
+{
+    ins_snapshot_t snap;
+
+    if (!INS_get_snapshot(&snap))
+    {
+        return;   /* 正在更新，下轮再来 */
+    }
+
+    write_float32_le(s_holding_regs, REG_IMU_ROLL,     snap.roll);
+    write_float32_le(s_holding_regs, REG_IMU_PITCH,    snap.pitch);
+    write_float32_le(s_holding_regs, REG_IMU_YAW,      snap.yaw);
+    write_float32_le(s_holding_regs, REG_IMU_GYRO_X,   snap.gyro_x);
+    write_float32_le(s_holding_regs, REG_IMU_GYRO_Y,   snap.gyro_y);
+    write_float32_le(s_holding_regs, REG_IMU_GYRO_Z,   snap.gyro_z);
+    write_float32_le(s_holding_regs, REG_IMU_AUTO_DUTY, (float)fan_auto_duty);
+    s_holding_regs[REG_IMU_STATUS] = (uint16_t)ins_get_status();
 }
 
 static uint8_t retentive_read_block(uint32_t addr, retentive_block_t *out_block)
@@ -804,6 +944,12 @@ static void modbus_write_single_register(uint16_t addr, uint16_t value)
         return;
     }
 
+    /* IMU 姿态输出区只读 */
+    if (is_imu_status_region(addr))
+    {
+        return;
+    }
+
     if ((addr >= REG_MOTOR_EN_BASE) && (addr <= (REG_MOTOR_WZ_HI + 1U)))
     {
         s_holding_regs[addr] = value;
@@ -821,7 +967,39 @@ static void modbus_write_single_register(uint16_t addr, uint16_t value)
     if (addr >= REG_FAN_DUTY_BASE && addr <= (REG_FAN_DUTY_BASE + REG_FAN_CNT - 1U))
     {
         s_holding_regs[addr] = value;
-        sync_fan_outputs_from_regs();
+        /* 自动模式下 0x0100 仅作为"手动备份值"保存，不驱动输出——
+         * 输出由 fan_auto_update() 每 5ms 覆盖，否则手动值与姿态值会互相打架。
+         * 切回手动（0x0140=0）后立即恢复生效，无需重新写一遍。 */
+        if (s_holding_regs[REG_AUTO_FAN_MODE] == 0U)
+        {
+            sync_fan_outputs_from_regs();
+        }
+        return;
+    }
+
+    /* 自动模式参数区：任意一项被改写后立即重新计算一次输出，
+     * 让上位机调参时能立刻看到效果（不必等下一轮 poll）。 */
+    if (is_auto_param_region(addr))
+    {
+        /* 磁力计相关为只读/保留项：本轮强行维持固定值 */
+        if ((addr == REG_AUTO_MAG_ENABLE) ||
+            (addr == REG_AUTO_MAG_STATUS) ||
+            (addr == REG_AUTO_MAG_CAL_CMD))
+        {
+            return;
+        }
+        /* 恒温目标温度：float32 占 2 个寄存器，由 Modbus 侧转发给 InsTask */
+        s_holding_regs[addr] = value;
+        if (addr == REG_AUTO_HEATER_TARGET)
+        {
+            /* 两个寄存器拼成 float32（高字在前），写完低字后再解释 */
+            float t;
+            uint32_t raw = ((uint32_t)s_holding_regs[REG_AUTO_HEATER_TARGET] << 16)
+                         | (uint32_t)s_holding_regs[REG_AUTO_HEATER_TARGET + 1U];
+            memcpy(&t, &raw, sizeof(t));
+            ins_set_target_temp(t);
+        }
+        fan_auto_update();
         return;
     }
 
@@ -950,6 +1128,29 @@ void modbus_init(void)
     s_holding_regs[REG_FAN_DUTY_BASE + 2U] = 0U;
     s_holding_regs[REG_FAN_DUTY_BASE + 3U] = 0U;
 
+    /* ---- 风机自动模式（姿态前馈）默认参数 ----
+     * 默认手动模式（FAN_MODE=0），避免上电瞬间风机动起来；
+     * 但 DUTY_FLAT / DUTY_MIN 等默认值已按"风洞爬行"场景预置，
+     * 上位机把 0x0140 写成 1、0x0141 写成 1 即可切入自动。
+     *
+     * 关键：DUTY_MIN 默认 30 —— 这个下限不是随便取的。
+     * 重力分量补偿的物理前提是"吸附力始终存在"，
+     * 一旦占空比掉到 0，风机停转、吸附力消失，小车直接脱离壁面。
+     * 因此即使姿态水平（1-cosθ = 0），输出也必须 >= DUTY_MIN。 */
+    s_holding_regs[REG_AUTO_FAN_MODE]      = 0U;
+    s_holding_regs[REG_AUTO_FAN_AUTO_EN]   = 0U;
+    s_holding_regs[REG_AUTO_DUTY_FLAT]     = 30U;
+    s_holding_regs[REG_AUTO_DUTY_MIN]      = 30U;
+    s_holding_regs[REG_AUTO_DUTY_MAX]      = 100U;
+    s_holding_regs[REG_AUTO_SLOPE_GAIN]    = 60U;
+    s_holding_regs[REG_AUTO_KP_PITCH]      = 0U;
+    s_holding_regs[REG_AUTO_KP_ROLL]       = 0U;
+    s_holding_regs[REG_AUTO_PITCH_OFFSET]  = 0U;
+    s_holding_regs[REG_AUTO_ROLL_OFFSET]   = 0U;
+    s_holding_regs[REG_AUTO_MAG_ENABLE]    = 0U;   /* 本轮不接磁力计 */
+    s_holding_regs[REG_AUTO_MAG_STATUS]    = 2U;   /* 2 = 未接入 */
+    s_holding_regs[REG_AUTO_MAG_CAL_CMD]   = 0U;   /* 保留 */
+
     MX_CAN1_Init();
     retentive_load_params();
     refresh_fan_state_registers();
@@ -968,6 +1169,14 @@ void modbus_poll(void)
     retentive_poll();
     motor_can_poll_rx();
     motor_can_tick();
+
+    /* 姿态前馈自动占空比：每轮 poll(5ms) 更新一次。
+     * 放在 ModbusTask 而非 InsTask 的原因：
+     *   - 风机输出是"执行器动作"，本就该由唯一的输出任务统一决策，避免两处竞态；
+     *   - InsTask 只负责算姿态并发布快照，职责单一；
+     *   - 5ms 刷新率对风洞爬行（速度很慢）而言已远超需求。 */
+    fan_auto_update();
+    refresh_imu_registers();
 
     while (ring_len() > 0U)
     {

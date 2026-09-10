@@ -48,11 +48,21 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/bsp/boards/bsp_led.c
    ${CMAKE_CURRENT_SOURCE_DIR}/bsp/boards/bsp_modbus.c
    ${CMAKE_CURRENT_SOURCE_DIR}/bsp/boards/bsp_pulse.c
+   ${CMAKE_CURRENT_SOURCE_DIR}/bsp/boards/bsp_spi.c
+   ${CMAKE_CURRENT_SOURCE_DIR}/bsp/boards/bsp_imu_pwm.c
+   ${CMAKE_CURRENT_SOURCE_DIR}/components/algorithm/MahonyAHRS.c
+   ${CMAKE_CURRENT_SOURCE_DIR}/components/algorithm/ins_task.c
+   ${CMAKE_CURRENT_SOURCE_DIR}/components/controller/pid.c
+   ${CMAKE_CURRENT_SOURCE_DIR}/components/devices/BMI088driver.c
+   ${CMAKE_CURRENT_SOURCE_DIR}/components/devices/BMI088Middleware.c
 )
 
 # Add include paths
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/bsp/boards
+    ${CMAKE_CURRENT_SOURCE_DIR}/components/algorithm
+    ${CMAKE_CURRENT_SOURCE_DIR}/components/controller
+    ${CMAKE_CURRENT_SOURCE_DIR}/components/devices
     ${CMAKE_CURRENT_SOURCE_DIR}/Inc
     ${CMAKE_CURRENT_SOURCE_DIR}/Middlewares/Third_Party/FreeRTOS/Source/include
     ${CMAKE_CURRENT_SOURCE_DIR}/Middlewares/Third_Party/FreeRTOS/Source/portable/GCC/ARM_CM4F

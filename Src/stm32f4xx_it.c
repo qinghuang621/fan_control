@@ -204,6 +204,7 @@ void DMA1_Stream1_IRQHandler(void)
 /* USER CODE BEGIN 1 */
 
 #include "tim.h"
+#include "spi.h"
 
 /* TIM1 捕获/比较中断（PWM1~PWM4 脉冲输入）
  * 注：只使用 CC 中断，不使用 TIM1 更新中断（TIM1_UP_TIM10） */
@@ -222,6 +223,15 @@ void TIM6_DAC_IRQHandler(void)
 {
     HAL_TIM_IRQHandler(&htim6);
 }
+
+/* ---------------- BMI088 采集相关中断 ----------------
+ * 注意：DMA2_Stream2/3 与 EXTI0/4/9_5 的处理函数**不在这里**，
+ * 而是集中放在 components/algorithm/ins_task.c 中。
+ * 原因：这些中断要直接读写采集状态机的位（gyro/accel/accel_temp_update_flag）
+ * 并调用 imu_cmd_spi_dma()，与 INS 任务耦合很紧；
+ * 且 SPI 收发是裸寄存器启动的（不经过 HAL 状态机），
+ * 不能走 HAL_DMA_IRQHandler，否则 HAL 会认为"无传输"而直接返回，
+ * 导致采集链路彻底停摆。集中在 ins_task.c 更清晰、也避免重复定义。 */
 
 /* USER CODE END 1 */
 /************************ (C) COPYRIGHT STMicroelectronics *****END OF FILE****/

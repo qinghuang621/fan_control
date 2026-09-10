@@ -60,6 +60,24 @@ void Error_Handler(void);
 /* Private defines -----------------------------------------------------------*/
 /* USER CODE BEGIN Private defines */
 
+/* ---------------- BMI088 (六轴 IMU) SPI1 片选 / 中断 ---------------- */
+#define CS1_ACCEL_Pin              GPIO_PIN_4
+#define CS1_ACCEL_GPIO_Port        GPIOA
+
+#define CS1_GYRO_Pin               GPIO_PIN_0
+#define CS1_GYRO_GPIO_Port         GPIOB
+
+#define INT1_ACCEL_Pin             GPIO_PIN_4
+#define INT1_ACCEL_GPIO_Port       GPIOC
+#define INT1_ACCEL_EXTI_IRQn       EXTI4_IRQn
+
+#define INT1_GYRO_Pin              GPIO_PIN_5
+#define INT1_GYRO_GPIO_Port        GPIOC
+#define INT1_GYRO_EXTI_IRQn        EXTI9_5_IRQn
+
+/* IST8310 占位：本轮不接磁力计，但 PG 口引脚已在 C 板上被 TIM1 FG / PG8 RS485 占用，
+ * 故此处不定义 RSTN/DRDY。下一轮接磁力计时再评估可用引脚。 */
+
 /* USER CODE END Private defines */
 
 #ifdef __cplusplus
