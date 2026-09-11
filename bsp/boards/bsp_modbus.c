@@ -485,7 +485,16 @@ static void refresh_fan_state_registers(void)
     {
         /* 风机状态写自己的区段，绝不碰电机状态区（running 地址 0x0064 起） */
         uint16_t status_base = (uint16_t)(REG_FAN_STATUS_BASE + i * REG_FAN_STATUS_STRIDE);
-        uint16_t duty = clamp_duty(s_holding_regs[REG_FAN_DUTY_BASE + i]);
+
+        /* ⚠️ 占空比反馈取「**实际加到定时器上的值**」，而不是 0x0100~0x0103 寄存器值。
+         * 原因：自动模式（0x0140=1 且 0x0141=1）下 0x0100~0x0103 只作"手动备份值"保存、
+         * **不驱动输出**，输出由 fan_auto_update() 每 5ms 用姿态算出来直接写 CCR。
+         * 若按寄存器回读，自动模式下这一格会永远停在最后一个手动值（曾是本工程的缺陷）。
+         * 通道映射与 sync_fan_outputs_from_regs() 保持一致：
+         *   风机 1 -> 通道 1（PWM5）、风机 2 -> 通道 2（PWM6）、
+         *   风机 3 与风机 4 -> 共用通道 3（PWM7），故两者读到同一个值（这是物理事实）。 */
+        uint8_t  ch   = (uint8_t)((i < 2U) ? (i + 1U) : 3U);
+        uint16_t duty = clamp_duty((uint16_t)fric_get_channel_duty(ch));
         uint32_t rpm = pulse_get_rpm((uint8_t)(i + 1U), 2U);
         uint32_t pulse_cnt = pulse_get_pulse_count((uint8_t)(i + 1U));
 
@@ -1424,6 +1433,13 @@ void modbus_poll(void)
      *   - InsTask 只负责算姿态并发布快照，职责单一；
      *   - 5ms 刷新率对风洞爬行（速度很慢）而言已远超需求。 */
     fan_auto_update();
+
+    /* 风机状态区无条件每轮刷新（放在这里而不是 fan_auto_update() 内部的原因：
+     * 后者有"非自动模式"和"姿态快照读失败"两条提前 return 路径，
+     * 把刷新挂在里面会漏掉这两条；而状态反馈应当始终反映真实输出，
+     * 与当前处于哪种模式无关。见 refresh_fan_state_registers() 的说明。 */
+    refresh_fan_state_registers();
+
     refresh_imu_registers();
 
     /* 加热 PWM 是只读诊断量，每轮刷新（不参与参数区的读写） */
