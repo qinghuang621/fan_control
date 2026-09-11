@@ -125,7 +125,7 @@
 
 ## 5. 运动学解算
 
-底盘为**正交全向轮**：LF/RR 是 X 轮（只吃 vx），RF/LR 是 Y 轮（只吃 vy），中心布局 0.15 m × 0.15 m，轮半径 0.05 m。最大轮速 ±30 rad/s，等比例限幅。
+底盘为**正交全向轮**：LF/RR 是 X 轮（只吃 vx），RF/LR 是 Y 轮（只吃 vy），中心布局 0.15 m × 0.15 m，轮半径 0.05 m。**最大轮速 ±50 rad/s，等比例限幅**（纯安全钳位；上位机 Fast 档最坏组合 vx=2.0 / vy=1.2 / wz=4.0 只到 46.0 rad/s，全程不触发；旧值 30 会把 Fast 档 vx 削掉 25%）。
 
 权威公式参考：`D:\stm32\running\Core\Src\kinematics.c`。**注意**：`running\RM_C_Board_Template\...\chassis_kinematics.c` 的公式不同（旋转项系数 1.0 而非 1.5），不能当参考。
 

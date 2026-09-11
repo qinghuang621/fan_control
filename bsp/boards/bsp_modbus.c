@@ -93,7 +93,16 @@ static const uint8_t c_cmd_disable[8]   = {0xFFU, 0xFFU, 0xFFU, 0xFFU, 0xFFU, 0x
 static const uint8_t c_cmd_clear_err[8] = {0xFFU, 0xFFU, 0xFFU, 0xFFU, 0xFFU, 0xFFU, 0xFFU, 0xFBU};
 
 #define REG_MOTOR_COUNT 4U
-#define REG_MOTOR_W_MAX 30.0f
+/* 四轮角速度等比例限幅（rad/s）。**纯安全钳位**：NaN/Inf 已单独归零，
+ * 这里只在"命令离谱"时按比例整体缩小，正常操作不该碰到它。
+ * 取值依据（2026-09-11 长老要求放宽，30 → 50）：
+ *   1) 上位机 `D:\stm32\host` 的 Fast 档最坏组合 vx=2.0 / vy=1.2 / wz=4.0
+ *      → 最大轮速 20*(2.0 + 0.075*4) = 46.0 rad/s；取 50 留余量、全程不触发限幅。
+ *      旧值 30 会把 Fast 档 vx 单独削到 30/40 = 0.75 倍（有效只剩 1.5 m/s）。
+ *   2) 电机 DM-S2325-1EC 输出轴额定 600 rpm ≈ 62.8 rad/s，50 rad/s(≈478 rpm)
+ *      仍留约 20% 余量。
+ * 标定用参考值：vx=1/vy=1/wz=1 → 21.5 rad/s，离钳位很远。 */
+#define REG_MOTOR_W_MAX 50.0f
 #define REG_MOTOR_LX 0.15f
 #define REG_MOTOR_LY 0.15f
 #define REG_MOTOR_R 0.05f
