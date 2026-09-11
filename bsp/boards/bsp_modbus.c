@@ -1246,13 +1246,26 @@ static uint8_t process_request(const uint8_t *request, uint16_t len, uint8_t *re
         {
             uint16_t start = (uint16_t)((uint16_t)request[2] << 8U | request[3]);
             uint16_t qty = (uint16_t)((uint16_t)request[4] << 8U | request[5]);
+            /* 边界检查三段：
+             *   ① qty==0 或 起始+数量 超表 → 非法数据地址(0x02)
+             *   ② **qty > 125** → 非法数据值(0x03)。
+             *      Modbus 规定 0x03/0x04 单次最多读 125 个寄存器（响应字节计数上限 250）。
+             *      旧实现只判 ①，若上位机一次读 >125（例如读 200 个），
+             *      下面 `response[2] = (uint8_t)(qty*2)` 会**回绕**（200*2=400 → (uint8_t)400=144），
+             *      且响应体 3+2*200+2 = 405 字节**远超 response[128] → 栈/静态缓冲越界写**，
+             *      上位机收到的就是长度不符的短包/脏包 → 报 Insufficient bytes received。
+             *      这是"怎么调都失败"的典型来源之一。 */
             if ((qty == 0U) || ((uint32_t)start + (uint32_t)qty > MODBUS_REG_COUNT))
             {
                 return build_exception(slave, func, 0x02U, response);
             }
+            if (qty > 125U)
+            {
+                return build_exception(slave, func, 0x03U, response);
+            }
             response[0] = slave;
             response[1] = func;
-            response[2] = (uint8_t)(qty * 2U);
+            response[2] = (uint8_t)(qty * 2U);   /* 现在 qty<=125，乘 2 最大 250，不会回绕 */
             uint16_t pos = 3U;
             /* 短临界区（对齐 running Regs_HoldingSnapshot）：
              * 多字 float32 由两个寄存器组成，若不加锁，
@@ -1416,6 +1429,16 @@ void modbus_poll(void)
     /* 加热 PWM 是只读诊断量，每轮刷新（不参与参数区的读写） */
     s_holding_regs[REG_AUTO_HEATER_PWM] = ins_get_heater_pwm();
 
+    /* 目标温度也做成本工程内的「真值镜像」。
+     * 坑：REG_AUTO_HEATER_TARGET(0x014D) 在 modbus_init 的默认参数表里**没有被初始化**，
+     * 也从不与 ins_task 内的 s_target_temp 同步 → 上电后这一格恒读 0，
+     * 而上位机文档写的是 45.0f，会让人误判"温控目标没设上"。
+     * 这里每轮从 ins_get_target_temp() 回写，保证：
+     *   ① 上电即显示真实目标（45.0f）；
+     *   ② 上位机写 0x014D → ins_set_target_temp() 改的是同一份真值，
+     *      下一轮镜像自然跟上，不会打架。 */
+    write_float32_le(s_holding_regs, REG_AUTO_HEATER_TARGET, ins_get_target_temp());
+
     while (ring_len() > 0U)
     {
         uint8_t byte = 0U;
@@ -1452,8 +1475,13 @@ void modbus_poll(void)
                     {
                         /* response 必须是 static：modbus_send_frame 走中断驱动发送，
                          * 函数返回后若响应还在栈上就会被后续函数调用覆盖。
-                         * 同一时刻只有一帧在发（Modbus 一问一答），无需加锁。 */
-                        static uint8_t response[128];
+                         * 同一时刻只有一帧在发（Modbus 一问一答），无需加锁。
+                         *
+                         * 大小 = 256：0x03/0x04 最坏 125 个寄存器 →
+                         *   1(站号)+1(功能码)+1(字节数)+250(数据)+2(CRC) = 255 字节。
+                         *   （旧值 128 在 qty>62 时会越界写 —— 已配合上面的
+                         *     qty<=125 检查一起修掉。）0x10 写响应 8 字节、异常响应 5 字节，都在内。 */
+                        static uint8_t response[256];
                         uint16_t response_len = process_request(frame, total_len, response);
                         if (response_len > 0U)
                         {

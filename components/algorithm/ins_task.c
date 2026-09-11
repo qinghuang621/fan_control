@@ -456,9 +456,15 @@ uint8_t ins_init(void)
 
     s_ins_task_handle = xTaskGetCurrentTaskHandle();
 
-    /* 允许 DRDY 中断发起 DMA。注意：此后数据流完全由硬件 DRDY 驱动，
-     * 任务不再主动轮询发起 —— 这也是例程的做法。 */
-    imu_start_dma_flag = 1U;
+    /* ⚠️ imu_start_dma_flag 推迟到预热循环之后再置 1（见下方）。
+     * 预热阶段用的是**阻塞式**读温度（BMI088_read_write_byte → HAL_SPI_TransmitReceive），
+     * 而 DRDY→DMA 走的是**裸寄存器自管**的 SPI1 收发。两者共用同一个 SPI1，
+     * 若在预热期就放行 DMA：两边同时写 SPI1->DR、同时抢 RXNE、同时切换 CS，
+     * 结果是温度读数变脏（PID 永远判不到达标，每次上电都满功率烧满 20s 超时），
+     * DMA 侧收到的是被偷走字节的残帧，CS 也可能被另一条路径打断。
+     * 例程没有预热循环（温控就在主循环里做），所以它能"初始化完立刻放行"；
+     * 本工程插了预热循环，就必须把放行点后移到循环之后，
+     * 以保持"进入 notify 等待循环前才放行 DMA"这一等价语义。 */
 
     /* 等温度首次达标（最长 20s，超时照样放行） */
     s_ins_status = INS_STATUS_WARMUP;
@@ -490,6 +496,11 @@ uint8_t ins_init(void)
             vTaskDelay(pdMS_TO_TICKS(50));
         }
     }
+
+    /* 预热结束，阻塞读全部退场：现在才允许 DRDY 中断发起 DMA。
+     * 此后数据流完全由硬件 DRDY 驱动，任务只在 ulTaskNotifyTake 上等待，
+     * 不再主动轮询发起 —— 与例程语义一致。 */
+    imu_start_dma_flag = 1U;
 
     s_ins_status = INS_STATUS_RUNNING;
     return 0;

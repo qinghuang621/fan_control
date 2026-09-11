@@ -83,6 +83,27 @@ void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
+  /*Configure GPIO pin : PG0 ---------------------------------------------------
+   * ⚠️⚠️ 这一行是采集链路的**命门**，删掉则姿态角恒为 0、温度恒为 0。
+   *
+   * PG0 在本工程不接任何外设，唯一用途是给 EXTI 提供一条"可软触发的线"：
+   * SPI1 DMA 收完一帧后，DMA2_Stream2_IRQHandler 调
+   *     __HAL_GPIO_EXTI_GENERATE_SWIT(GPIO_PIN_0)
+   * （宏展开就是 EXTI->SWIER |= GPIO_PIN_0）来唤醒阻塞在 ulTaskNotifyTake 的 InsTask。
+   *
+   * 关键点：SWIER 只是**把 PR0 挂起位置 1**，真正送达 NVIC 还要过 IMR（中断屏蔽寄存器）。
+   * 而 IMR0 只有在该线被配成 EXTI 输入模式（GPIO_MODE_IT_xxx）时才会被 HAL 置位。
+   * 所以**必须**保留这行把 PG0 配成 IT 模式——哪怕它没接东西。
+   * 只调 HAL_NVIC_EnableIRQ(EXTI0_IRQn) 是不够的：NVIC 开了但 IMR0=0，
+   * 软触发永远到不了中断服务函数 → 现象就是"通信全通、状态字=2(RUNNING)，
+   * 但 roll/pitch/温度恒 0、加热 PWM 卡死在 4499"。
+   * 参见 DJI 例程 18.ins_task/Src/gpio.c：那里把 GPIO_PIN_0 与 DRDY_IST8310 一起
+   * 配成了 GPIO_MODE_IT_FALLING（同在 GPIOG），本工程照此对齐。 */
+  GPIO_InitStruct.Pin  = GPIO_PIN_0;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(GPIOG, &GPIO_InitStruct);
+
   /* EXTI interrupt init -------------------------------------------------------*/
   /* ⚠️ 这两个中断是**采集链路的唯一触发器**，必须使能！
    * BMI088 每完成一次转换就拉低对应 INT1 引脚，中断里才发起 SPI1 DMA。
@@ -96,7 +117,7 @@ void MX_GPIO_Init(void)
   /* EXTI0 软中断：由 SPI1 DMA 接收完成中断里 __HAL_GPIO_EXTI_GENERATE_SWIT(GPIO_PIN_0)
    * 软件触发，用于把 InsTask 从 ulTaskNotifyTake 中唤醒。
    * 优先级 6：数值比 DMA 的 5 大 = 优先级更低，保证 DMA 链路先跑完。
-   * EXTI0 对应 PA0，本工程 PA0 未接外设，纯软件触发，无冲突。 */
+   * EXTI0 线由上面的 PG0 提供（未接外设，纯软件触发，无冲突）。 */
   HAL_NVIC_SetPriority(EXTI0_IRQn, 6, 0);
   HAL_NVIC_EnableIRQ(EXTI0_IRQn);
 
