@@ -11,8 +11,18 @@
 - **风机子系统**：4 路 FG 反馈 + 3 路同步 PWM 输出，与 EBS-P300 / ROS2 上位机通过 Modbus RTU 通信。
 - **电机子系统**：4 个达妙电机 CAN 1 Mbps 控制，运行项目的正交全向轮运动学解算。
 
-硬件平台：STM32F407VET6（LQFP100 封装，与 C 板手册一致）。
+硬件平台：**STM32F407IGH6**（UFBGA176 封装，1 MB Flash / 128 KB SRAM + 64 KB CCMRAM）——
+以 `.ioc` 的 `Mcu.CPN` 与 `STM32F407xx_FLASH.ld` 的存储器布局为准。
 软件架构：FreeRTOS 多任务（`ModbusTask` / `FanTask` / `PulseTask` / `LedTask`），1 ms HAL 时基（TIM6）+ FreeRTOS SysTick 节拍（`xPortSysTickHandler`），Cortex-M4F 168 MHz。
+
+### 参考资料
+
+| 资料 | 出处 |
+|---|---|
+| 《RoboMaster 开发板 C 型用户手册》 | 官方下载页：<https://www.robomaster.com/zh-CN/products/components/general/development-board-type-c#downloads> |
+
+> 该 PDF 约 1.9 MB，**不入库**（`.gitignore` 已排除 `RoboMaster*.pdf`），需要时按上面的链接自行下载。
+> 引脚定义、CAN 口线序、加热电路规格等均以该手册与代码为准。
 
 ## 2. 硬件连接
 
@@ -85,7 +95,13 @@
 
 ### 2.4 不再使用的接口
 
-- **USB CDC 虚拟串口**：已整体下线。主因是 PA11/PA12 实际是 USB 引脚，PD0/PD1 才是 CAN。删除清单：`Src/usb_device.c`、`Src/usbd_*.c`、`Src/usbd_*.h`、USB 设备库、Drivers 中的 `stm32f4xx_hal_pcd*.c` / `stm32f4xx_ll_usb.c`。固件体积从 56 KB 降到 31.7 KB。
+- **USB CDC 虚拟串口**：已整体下线。主因是 PA11/PA12 实际是 USB 引脚，PD0/PD1 才是 CAN。
+  - **已从仓库删除**：`Src/usb_device.c`、`Src/usbd_conf.c`、`Src/usbd_desc.c`、`Src/usbd_cdc_if.c`，
+    以及 `Middlewares/ST/STM32_USB_Device_Library/`。
+  - **仍在盘上、但未参与构建**：`Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_pcd.c`、
+    `stm32f4xx_hal_pcd_ex.c`、`stm32f4xx_ll_usb.c`。这三个是 HAL 库原件，CubeMX 重新生成会拉回，故保留。
+  - 是否参与构建，以 `cmake/stm32cubemx/CMakeLists.txt` 的源文件清单为准（第 62~63 行有说明）。
+  - 固件体积从 56 KB 降到 31.7 KB。
 
 ## 3. 软件架构（FreeRTOS 4 任务）
 
@@ -179,7 +195,15 @@ cmake --preset Debug
 cmake --build build/Debug -- -j 8
 ```
 
-产物：`build/Debug/pwm_snail.{elf,hex,bin}`，当前约 32 KB Flash / 28 KB RAM。烧录工具按 C 板使用 ST-Link 即可。
+产物：`build/Debug/pwm_snail.{elf,hex,bin}`，当前约 32 KB Flash / 28 KB RAM。烧录工具按 C 板使用 ST-Link 即可（`openocd.cfg` 与 `.vscode/tasks.json` 里有现成的构建 / 烧录 / 调试任务）。
+
+> ⚠️ **不要再用 `pwm_snail.ioc` 重新生成代码。** 该 `.ioc` 停留在移植初期：
+> 它仍勾选着已废弃的 `USB_DEVICE`（CDC），重新生成会把 `Src/usb_device.c` 等文件和一整套
+> USB 初始化再拉回来；更严重的是**重新生成会覆盖 `main.c` / `gpio.c` / `usart.c` / `tim.c`**，
+> 抹掉手改的 **PG0 EXTI 配置**（IMU 采集链路的命门）、**USART6 裸寄存器收发**、
+> **TIM10 恒温 PWM** 等 —— 这些都不在 CubeMX 的表达能力之内。
+> `.ioc` 现在只作**引脚分配参考**保留，真值以 `Src/` 下的代码为准。
+> （同理，`MDK-ARM/` Keil 工程已删除，本项目只用 CMake + GCC 工具链。）
 
 ## 9. 当前状态
 
@@ -193,12 +217,15 @@ cmake --build build/Debug -- -j 8
 - 正交全向轮运动学解算（与 `D:\stm32\running\Core\Src\kinematics.c` 逐行一致）
 - 通信丢失保护 / NaN 防护 / 500 ms 心跳超时
 - 参数区 Flash A/B 双区断电保持，2 s 落盘防抖
+- IMU 六轴姿态解算（BMI088 + Mahony）+ 陀螺零偏/温度闭环，姿态与温度输出到 `0x0150~0x015F`
+- 风机自动模式：由 roll/pitch 前馈计算占空比，参数区 `0x0140~0x014F`（控制律与标定见 `标定手册.md`）
 
 剩余项（按后续计划）：
 
 - 上位机 / EBS-P300 / ROS2 联调
 - 真实硬件跑直线/自转验证电机方向与 running 一致
-- `applications/remote_control.c`（SBUS 解析，目前未参与构建）、`bsp/boards/bsp_rc.c` 是历史遗留，下一步视项目是否引入遥控器决定清理或接入
+- **倾斜角 → 风机占空比标定**（求 `DUTY_FLAT` / `SLOPE_GAIN`），流程见 `标定手册.md`
+- 恒温加热功率不足：满功率下只到 ~34 ℃（约额定的 1/4），疑与 USB 供电的 5V 轨有关，待换电源复测
 
 ## 10. 上层使用提示（避坑）
 

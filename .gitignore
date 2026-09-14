@@ -5,6 +5,11 @@ build/
 .vs/
 *.uvguix.*
 *.uvoptx
+.mxproject
+MDK-ARM/
+
+# 硬件手册（不入库，见 readme.md「参考资料」的官方下载链接）
+RoboMaster*.pdf
 
 # Compiled firmware and intermediate files
 *.elf
