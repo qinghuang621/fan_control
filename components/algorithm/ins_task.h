@@ -21,6 +21,20 @@ typedef struct
     float accel_y;
     float accel_z;
     float temperature;  /* ℃, BMI088 板载传感器 */
+
+    /* 姿态四元数，顺序 (w, x, y, z)，表示**机体系 → 世界系**的旋转，
+     * 即 v_world = R(q) · v_body。
+     *
+     * ⚠️ 加在结构体**末尾**是刻意的：不动已有字段的内存布局，
+     *    既有消费方（bsp_led_tilt.c 等）无需改动。
+     *
+     * ⚠️ 与 ROS2 `geometry_msgs/Quaternion` 的字段顺序**相反**
+     *    （ROS 是 x,y,z,w；我们是 w,x,y,z）。发布时必须显式映射，**不能内存直拷**。
+     *    详见 `接口文档.md` §6.8。 */
+    float quat_w;
+    float quat_x;
+    float quat_y;
+    float quat_z;
 } ins_snapshot_t;
 
 /* ============================ 运行状态 ============================ */

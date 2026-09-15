@@ -59,9 +59,21 @@ static volatile uint16_t s_tx_pos = 0U;
 #define FLASH_RETENTIVE_A_ADDR 0x080C0000UL
 #define FLASH_RETENTIVE_B_ADDR 0x080E0000UL
 #define FLASH_RETENTIVE_MAGIC 0x524D4352UL
-#define FLASH_RETENTIVE_VERSION 1UL
-#define FLASH_RETENTIVE_PARAM_COUNT 48U
-#define FLASH_RETENTIVE_BLOCK_SIZE 112U
+/* ⚠️ 改过 values[] 长度就必须升版本：旧镜像的 CRC 会算不过，
+ * 但显式升版本更干净、也便于排查"为什么参数没恢复"。 */
+#define FLASH_RETENTIVE_VERSION 2UL
+/* 保持区覆盖 0x0090~0x0173（连续）：48 → 228。
+ * 为什么要扩（2026-09-15）：原先只保持 0x0090~0x00BF，导致 `0x0140~0x014F`（风机自动参数）
+ * 与 LUT **复位即丢** → 复位后 FAN_MODE 回 0、0x0100~0x0103 回 0 → 风机全停 → 小车掉壁。
+ * 顺带把手动占空比 0x0100~0x0103 也纳入了保持。
+ * 块大小 = 16 字节头 + 228*2 = 472 字节（仍是 4 字节对齐，逐字烧写 118 个 word）。
+ *
+ * ⚠️ 已核实：扩区**不会**造成每 5ms 写 Flash。所有每轮镜像刷新
+ * （refresh_fan_state_registers / refresh_imu_registers / modbus_poll 里的 0x014D/4E/4F）
+ * 都是**直接赋值** s_holding_regs[...]，**不走 modbus_write_single_register()**；
+ * 脏标志只在那个函数末尾置位。 */
+#define FLASH_RETENTIVE_PARAM_COUNT 228U
+#define FLASH_RETENTIVE_BLOCK_SIZE 472U
 
 /* 参考 running 项目的 Modbus 地址规划；为避免与电机控制区冲突，风机占空比控制区被挪到 0x0100 以后。
  * 0x0000~0x0019 : CAN 电机控制区（保持与 running 完全一致）
@@ -196,6 +208,50 @@ static const uart_cfg_t *uart_cfg_lookup(uint16_t idx)
 /* 诊断用：温度×10 的有符号整数（如 43.5℃ -> 435）。放不下 float32，
  * 故用整数形式占最后 1 个寄存器。用于排查"卡在 WARMUP"这类问题。 */
 #define REG_IMU_TEMP_X10       0x015FU
+
+/* ==================== 风机查表（LUT）模式 0x0160~0x016F ====================
+ * 为什么需要：现行 `duty = FLAT + GAIN*(1-cosθ)` 是**单调**直线，只在 [0°,90°] 标定。
+ * 而风洞外围爬行要覆盖到 180°（完全倒立），实际所需吸附力在**侧壁 90° 达峰、
+ * 到倒立区反而回落** —— 形状根本不符，不是精度问题。论证与标定流程见 `标定手册.md` §8。
+ * 这里只做三件事：存表、查表、线性插值。**不做任何拟合。** */
+#define REG_LUT_BASE       0x0160U  /* DUTY_LUT[0..12]，θ = 0°,15°,…,180° */
+#define REG_LUT_COUNT      13U
+#define REG_LUT_MAGIC      0x016DU  /* 写 0xA5C3 表示表有效；否则自动回退线性模型 */
+#define REG_LUT_MAGIC_VAL  0xA5C3U
+#define REG_IMU_THETA      0x016EU  /* 实时 θ(deg) float32，**只读**，占 0x016E~0x016F */
+
+/* 断电保持区的**上界**（见下方 FLASH_RETENTIVE_* 常量）。2026-09-15 由 0x00BF 扩到这里，
+ * 目的：`0x0140~0x014F` 与 LUT 复位即丢 → 复位后 FAN_MODE 回 0、风机全停 → 掉壁。 */
+#define REG_RETENTIVE_END  0x0173U
+
+/* ==================== IMU 四元数输出 0x0174~0x017B（只读） ====================
+ * 4 个 float32，高字在前，每 5ms 刷新。
+ * **刻意放在断电保持区之外**（保持区到 0x0173 为止）：这是实时量，
+ * 持久化它没有意义，还会白占 8 个寄存器的 Flash 空间。
+ * 顺序 (w,x,y,z)、**机体系 → 世界系**（v_world = R(q)·v_body）。
+ * ⚠️ 与 ROS2 的 `geometry_msgs/Quaternion` 字段顺序 (x,y,z,w) **相反**，
+ *    发布时必须显式映射，不能内存直拷。详见 `接口文档.md` §6.8。 */
+#define REG_IMU_QUAT_W     0x0174U
+#define REG_IMU_QUAT_X     0x0176U
+#define REG_IMU_QUAT_Y     0x0178U
+#define REG_IMU_QUAT_Z     0x017AU
+#define REG_IMU_QUAT_END   0x017BU
+
+#define LUT_STEP_DEG       15.0f
+#define LUT_DEG2RAD        0.017453292519943295f
+#define LUT_RAD2DEG        57.29577951308232f
+
+/* 13 个**占位值**：由理论模型算出，**没有任何实测依据**，等小车能跑后逐点标定覆盖。
+ * 模型：`N_req/mg = sinθ/μ`（θ≤90°，摩擦/下滑主导）
+ *                    `= max(sinθ/μ, -cosθ)`（θ>90°，脱离壁面主导）
+ *       占空比→吸力按 `N ∝ duty²`（轴流推力 ∝ 转速²）⇒ `duty ∝ √N`
+ * 锚点：保留原默认值在 θ=0° 与 θ=90° 两处不变（30% / 90%），只修正中间与倒立区的形状。
+ * 取 μ=0.7（橡胶/涂装面量级）。**μ≤1 时峰值落在 90°；μ>1 才移到 180°。**
+ * 生成脚本与敏感度表见 `标定手册.md` §8.9。 */
+static const uint16_t s_duty_lut_default[REG_LUT_COUNT] = {
+     30U,  46U,  64U,  76U,  84U,  88U,  90U,
+     88U,  84U,  76U,  70U,  74U,  75U,
+};
 
 static uint16_t s_holding_regs[MODBUS_REG_COUNT];
 static uint8_t s_param_dirty = 0U;
@@ -461,9 +517,13 @@ static uint8_t is_can_status_region(uint16_t addr)
     return (addr >= REG_CAN_STATUS_BASE) && (addr <= REG_CAN_STATUS_END);
 }
 
+/* 断电保持区：0x0090~0x0173（含风机自动参数 0x0140~0x014F 与 LUT 0x0160~0x016F）。
+ * 写入后由 s_param_dirty 延迟 2s 去抖落盘，见 retentive_poll()。
+ * ⚠️ 上界是 REG_RETENTIVE_END 而不是 REG_PARAM_END —— 扩区前这两者恰好相邻，
+ * 改的时候漏一个就会"参数能写但不落盘"。 */
 static uint8_t is_param_region(uint16_t addr)
 {
-    return (addr >= REG_PARAM_BASE) && (addr <= REG_PARAM_END);
+    return (addr >= REG_PARAM_BASE) && (addr <= REG_RETENTIVE_END);
 }
 
 static uint8_t is_auto_param_region(uint16_t addr)
@@ -472,10 +532,16 @@ static uint8_t is_auto_param_region(uint16_t addr)
 }
 
 /* IMU 姿态输出区为只读：上位机写这些地址一律静默忽略（不返回异常码，
- * 保持与既有状态区 0x0040~0x008F 相同的"写无效但不报错"行为，便于上位机统一处理）。 */
+ * 保持与既有状态区 0x0040~0x008F 相同的"写无效但不报错"行为，便于上位机统一处理）。
+ * 覆盖三段：① `0x0150~0x015F` 姿态/角速度/温度；
+ *          ② `0x016E~0x016F` TILT_THETA（float32 实时 θ）；
+ *          ③ `0x0174~0x017B` 姿态四元数。
+ * 这些都是每 5ms 被 refresh_imu_registers() 覆盖的实时量，允许写只会静默失效、徒增困惑。 */
 static uint8_t is_imu_status_region(uint16_t addr)
 {
-    return (addr >= REG_IMU_BASE) && (addr <= REG_IMU_END);
+    return ((addr >= REG_IMU_BASE) && (addr <= REG_IMU_END)) ||
+           ((addr >= REG_IMU_THETA) && (addr <= (uint16_t)(REG_IMU_THETA + 1U))) ||
+           ((addr >= REG_IMU_QUAT_W) && (addr <= REG_IMU_QUAT_END));
 }
 
 static uint8_t get_modbus_slave_addr(void)
@@ -556,18 +622,58 @@ static void sync_fan_outputs_from_regs(void)
  *       实际吸附效果还需靠 DUTY_MIN 兜底 + 现场标定 SLOPE_GAIN。 */
 static uint16_t fan_auto_duty = 0U;
 
+/* 查表 + 线性插值：θ(deg) → 占空比(%)。
+ * 表步长 15°、13 个点覆盖 θ ∈ [0°,180°]；越界一律取端点值（不外推）。 */
+static float fan_lut_interp(float theta_deg)
+{
+    float pos = theta_deg / LUT_STEP_DEG;
+    float a, b;
+    uint16_t i;
+
+    if (pos <= 0.0f)
+    {
+        return (float)s_holding_regs[REG_LUT_BASE];
+    }
+    if (pos >= (float)(REG_LUT_COUNT - 1U))
+    {
+        return (float)s_holding_regs[REG_LUT_BASE + REG_LUT_COUNT - 1U];
+    }
+
+    i = (uint16_t)pos;      /* 上面已保证 0 < pos < 12，不会越界 */
+    a = (float)s_holding_regs[REG_LUT_BASE + i];
+    b = (float)s_holding_regs[REG_LUT_BASE + i + 1U];
+    return a + (b - a) * (pos - (float)i);
+}
+
 static void fan_auto_update(void)
 {
     ins_snapshot_t snap;
     float roll_deg, pitch_deg;
-    float cos_theta;
+    float cos_theta, theta_deg;
     float duty_f;
-    uint16_t duty_flat, duty_min, duty_max, slope_gain;
+    uint16_t duty_min, duty_max, mode;
     uint16_t out;
 
     /* 只有"自动模式 + 总开关打开"才接管；否则沿用 0x0100 的手动值 */
-    if ((s_holding_regs[REG_AUTO_FAN_MODE] == 0U) ||
-        (s_holding_regs[REG_AUTO_FAN_AUTO_EN] == 0U))
+    mode = s_holding_regs[REG_AUTO_FAN_MODE];
+    if ((mode == 0U) || (s_holding_regs[REG_AUTO_FAN_AUTO_EN] == 0U))
+    {
+        fan_auto_duty = 0U;
+        return;
+    }
+
+    /* ⚠️ IMU 未进入 RUNNING 之前**不接管**，让 0x0100~0x0103 的手动值生效。
+     * 为什么必须有这道门：InsTask 在 WARMUP 期间以 `while (!s_first_temperate)`
+     * 阻塞轮询、**根本不调用 publish_snapshot()**，而 s_snap_seq 初值为 0（偶数）→
+     * INS_get_snapshot() 会**返回"成功"但给出全 0 的快照** → 本函数算得 pitch=roll=0
+     * → θ=0 → 输出"水平档"占空比。该窗口上限 INS_TEMP_BOOT_TIMEOUT_MS = **20 秒**
+     * （且因加热功率不足，实际大概率跑满超时而不是温度达标）。
+     * 若小车停在侧壁上时板子复位（掉电/看门狗/EMI/手按复位），这 20 秒会把它吹下来。
+     *
+     * 回退到手动通道即可自保：只要事先把 0x0100~0x0103 写成高位值
+     * （该值 2026-09-15 起已随断电保持一起持久化）。地上开机时它是 0 → 风机不转，
+     * 等 RUNNING 后自动接管，行为不意外。 */
+    if (ins_get_status() != INS_STATUS_RUNNING)
     {
         fan_auto_duty = 0U;
         return;
@@ -579,21 +685,42 @@ static void fan_auto_update(void)
         return;
     }
 
-    duty_flat  = s_holding_regs[REG_AUTO_DUTY_FLAT];
-    duty_min   = s_holding_regs[REG_AUTO_DUTY_MIN];
-    duty_max   = s_holding_regs[REG_AUTO_DUTY_MAX];
-    slope_gain = s_holding_regs[REG_AUTO_SLOPE_GAIN];
+    duty_min = s_holding_regs[REG_AUTO_DUTY_MIN];
+    duty_max = s_holding_regs[REG_AUTO_DUTY_MAX];
 
     /* 零位偏置：补偿 IMU 安装误差 */
     pitch_deg = snap.pitch - (float)(int16_t)s_holding_regs[REG_AUTO_PITCH_OFFSET];
     roll_deg  = snap.roll  - (float)(int16_t)s_holding_regs[REG_AUTO_ROLL_OFFSET];
 
-    /* 转弧度后合成总倾角余弦 */
-    cos_theta = cosf(pitch_deg * 0.017453292f) * cosf(roll_deg * 0.017453292f);
+    /* 合成总倾角余弦。
+     * ⚠️ cos(pitch)*cos(roll) **恒等于旋转矩阵的 R33**，是四元数的光滑函数 ——
+     * 即使 pitch 撞上万向节死锁(±90°)，这个乘积仍然稳（数值验证 duty 标准差 <0.01%）。
+     * 反过来，单独取 roll / pitch 用会在死锁处剧烈抖动（圆周标准差可达 157°）。
+     * **所以不要"为了更清楚"把它拆成两个角分别用。** */
+    cos_theta = cosf(pitch_deg * LUT_DEG2RAD) * cosf(roll_deg * LUT_DEG2RAD);
 
-    duty_f = (float)duty_flat + (float)slope_gain * (1.0f - cos_theta);
+    if ((mode == 2U) && (s_holding_regs[REG_LUT_MAGIC] == REG_LUT_MAGIC_VAL))
+    {
+        /* ---- 查表模式 ----
+         * 魔数不匹配时**自动回退线性模型**，绝不输出 0：
+         * 未标定时整张表是 0，直接驱动会让吸附力归零、小车掉壁。
+         * 这是设计上的安全阀，"写了表但不写魔数 → 不生效"是有意为之。 */
+        if (cos_theta < -1.0f) { cos_theta = -1.0f; }
+        if (cos_theta >  1.0f) { cos_theta =  1.0f; }
+        theta_deg = acosf(cos_theta) * LUT_RAD2DEG;
+        duty_f = fan_lut_interp(theta_deg);
+    }
+    else
+    {
+        /* ---- 线性模式（默认；行为与 2026-09-15 之前逐字一致）----
+         * 只在 [0°,90°] 标定是自洽的；风洞爬行（要覆盖 180°）请用 mode 2。 */
+        float duty_flat  = (float)s_holding_regs[REG_AUTO_DUTY_FLAT];
+        float slope_gain = (float)s_holding_regs[REG_AUTO_SLOPE_GAIN];
+        duty_f = duty_flat + slope_gain * (1.0f - cos_theta);
+    }
 
-    /* 下限兜底：吸附力绝不能为零 */
+    /* 下限兜底：吸附力绝不能为零。
+     * 查表模式下同样要过这一关 —— 表里可能被写进低于 DUTY_MIN 的值。 */
     if (duty_f < (float)duty_min) duty_f = (float)duty_min;
     if (duty_f > (float)duty_max) duty_f = (float)duty_max;
     if (duty_f > 100.0f) duty_f = 100.0f;
@@ -630,6 +757,29 @@ static void refresh_imu_registers(void)
     write_float32_le(s_holding_regs, REG_IMU_GYRO_Y,   snap.gyro_y);
     write_float32_le(s_holding_regs, REG_IMU_GYRO_Z,   snap.gyro_z);
     write_float32_le(s_holding_regs, REG_IMU_AUTO_DUTY, (float)fan_auto_duty);
+
+    /* 实时总倾角 θ = acos(cos(pitch−off)·cos(roll−off))，单位度，范围 0~180。
+     * **专为 LUT 标定加的**：标定时需要知道"现在摆到几度了"，
+     * 只看 roll/pitch 自己在脑子里合算很容易摆错。
+     * 零位偏置取法与 fan_auto_update() 一致，保证这里读到的 θ
+     * 与控制器内部真正用的 θ 是同一个数（否则标定会系统性偏移）。 */
+    {
+        float p_off = snap.pitch - (float)(int16_t)s_holding_regs[REG_AUTO_PITCH_OFFSET];
+        float r_off = snap.roll  - (float)(int16_t)s_holding_regs[REG_AUTO_ROLL_OFFSET];
+        float ct = cosf(p_off * LUT_DEG2RAD) * cosf(r_off * LUT_DEG2RAD);
+        if (ct < -1.0f) { ct = -1.0f; }
+        if (ct >  1.0f) { ct =  1.0f; }
+        write_float32_le(s_holding_regs, REG_IMU_THETA, acosf(ct) * LUT_RAD2DEG);
+    }
+
+    /* 姿态四元数，顺序 (w,x,y,z)、机体系→世界系。**原样上抛，不做任何转换**：
+     * 没有万向节死锁（欧拉角的 pitch 被 asin 限死在 ±90°），信息也完整，
+     * 上位机可自行换算成欧拉角/旋转矩阵/轴角，ROS2 更是原生就用四元数。
+     * ⚠️ ROS2 的 geometry_msgs/Quaternion 字段顺序是 (x,y,z,w)，与本表**相反**。 */
+    write_float32_le(s_holding_regs, REG_IMU_QUAT_W, snap.quat_w);
+    write_float32_le(s_holding_regs, REG_IMU_QUAT_X, snap.quat_x);
+    write_float32_le(s_holding_regs, REG_IMU_QUAT_Y, snap.quat_y);
+    write_float32_le(s_holding_regs, REG_IMU_QUAT_Z, snap.quat_z);
 
     /* 温度 ×10 存为有符号整数（诊断用）。钳位到 int16 范围防溢出。 */
     temp = snap.temperature;
@@ -1210,6 +1360,25 @@ static void modbus_write_single_register(uint16_t addr, uint16_t value)
             memcpy(&t, &raw, sizeof(t));
             ins_set_target_temp(t);
         }
+        /* ⚠️ 必须在这里显式置脏标志：本分支**提前 return**，走不到函数末尾那段
+         * "if (is_param_region(addr)) s_param_dirty = 1U"。
+         * 2026-09-15 之前这个分支一直没有置位 → 风机自动参数**从不落盘**，
+         * 复位后 FAN_MODE 回 0、风机全停。现已纳入断电保持区，特此补上。 */
+        s_param_dirty = 1U;
+        s_param_dirty_tick_ms = HAL_GetTick();
+        fan_auto_update();
+        return;
+    }
+
+    /* LUT 查表区 0x0160~0x016D：可写，写完立刻重算一次输出，
+     * 让调表时能马上看到效果（与自动参数区行为一致）。
+     * 同样要显式置脏标志 —— 本分支也提前 return。
+     * （0x016E/0x016F 是只读的 TILT_THETA，已在上面 is_imu_status_region 拦掉。） */
+    if ((addr >= REG_LUT_BASE) && (addr <= REG_LUT_MAGIC))
+    {
+        s_holding_regs[addr] = value;
+        s_param_dirty = 1U;
+        s_param_dirty_tick_ms = HAL_GetTick();
         fan_auto_update();
         return;
     }
@@ -1381,6 +1550,22 @@ void modbus_init(void)
     s_holding_regs[REG_AUTO_MAG_ENABLE]    = 0U;   /* 本轮不接磁力计 */
     s_holding_regs[REG_AUTO_MAG_STATUS]    = 2U;   /* 2 = 未接入 */
     s_holding_regs[REG_AUTO_MAG_CAL_CMD]   = 0U;   /* 保留 */
+
+    /* ---- 风机查表（LUT）模式默认值 ----
+     * ⚠️ 这 13 个值是**理论模型算出来的占位值，没有任何实测依据**
+     *（见 s_duty_lut_default 的说明与 `标定手册.md` §8.9）。
+     * 现在填进去是因为暂时没有大角度/倒立工装，先用模型值把链路跑通；
+     * 等小车能跑后逐点标定、用 Modbus 覆盖这 13 格即可，**固件不用改**。
+     *
+     * 魔数一并置位，让 FAN_MODE=2 **开箱即可用**（否则要先写魔数才生效，
+     * 多一道无谓的手续）。安全上可接受：占位值全部 ≥ DUTY_MIN，
+     * 即使模型不准也只是"吸力偏大/偏小"，不会出现吸附力归零。
+     * 若想改成"必须显式标定后才允许查表"，把下面这行改成 = 0U 即可。 */
+    for (uint16_t i = 0U; i < REG_LUT_COUNT; ++i)
+    {
+        s_holding_regs[REG_LUT_BASE + i] = s_duty_lut_default[i];
+    }
+    s_holding_regs[REG_LUT_MAGIC] = REG_LUT_MAGIC_VAL;
 
     MX_CAN1_Init();
     retentive_load_params();

@@ -159,6 +159,17 @@ static void publish_snapshot(void)
     tmp.accel_z = s_accel[2];
     tmp.temperature = s_temp;
 
+    /* 四元数**原样上抛**，不做任何转换。
+     * 理由：① 没有万向节死锁（欧拉角的 pitch 被 asin 限死在 ±90°）；
+     *       ② 信息完整，上位机可自行换算成任意表示；
+     *       ③ ROS2 原生就是四元数，省掉节点里的一次转换。
+     * 内部 q[] 由 MahonyAHRSupdateIMU 维护，约定为 (w,x,y,z)、机体系→世界系
+     * （依据：其更新式为右乘 q̇ = 0.5·q⊗ω_body）。 */
+    tmp.quat_w = q[0];
+    tmp.quat_x = q[1];
+    tmp.quat_y = q[2];
+    tmp.quat_z = q[3];
+
     s_snap_seq++;                    /* -> 奇数，标志"正在写" */
     __DMB();
     s_snap = tmp;
