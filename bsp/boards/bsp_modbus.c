@@ -268,6 +268,27 @@ typedef struct
     uint16_t values[FLASH_RETENTIVE_PARAM_COUNT];
 } retentive_block_t;
 
+/* ---- 编译期断言：把"必须同步修改"的几个常量钉死 ----
+ * 背景（2026-09-15）：FLASH_RETENTIVE_BLOCK_SIZE 原先只被定义、**从未被任何代码引用**，
+ * 纯粹是个"文档性常量"。也就是说改 PARAM_COUNT 而忘了同步 BLOCK_SIZE，
+ * 编译器不会有任何反应 —— 这次扩区（48→228）是靠手工验算才发现两者对得上的。
+ * 加断言后，这三处一旦不同步就**直接编译失败**，不用再靠人眼。
+ *
+ * 断言内容：
+ *   ① 结构体真实大小 == FLASH_RETENTIVE_BLOCK_SIZE
+ *      （= 16 字节头 + PARAM_COUNT×2）
+ *   ② 保持区寄存器范围 [REG_PARAM_BASE, REG_PARAM_BASE+PARAM_COUNT-1]
+ *      必须正好结束于 REG_RETENTIVE_END —— 否则 is_param_region() 与
+ *      实际落盘的寄存器范围不一致，会出现"能写但不落盘"或"落盘了但只读得回一半"。
+ *
+ * ⚠️ 断言消息**必须用 ASCII/英文**：源文件是 UTF-8，而 GCC 对字符串字面量按默认字符集
+ *    处理，中文消息会被编成 `\37777777745...` 之类的乱码，等于没有提示。
+ *    （本文件的中文注释不受影响 —— 编译期就被剥掉了。） */
+_Static_assert(sizeof(retentive_block_t) == FLASH_RETENTIVE_BLOCK_SIZE,
+               "retentive_block_t size != FLASH_RETENTIVE_BLOCK_SIZE");
+_Static_assert((REG_PARAM_BASE + FLASH_RETENTIVE_PARAM_COUNT - 1U) == REG_RETENTIVE_END,
+               "retentive region end != REG_RETENTIVE_END");
+
 static void motor_can_poll_rx(void);
 
 static uint16_t crc16_update(uint16_t crc, uint8_t byte)
