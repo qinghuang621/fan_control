@@ -190,7 +190,7 @@ static const uart_cfg_t *uart_cfg_lookup(uint16_t idx)
 #define REG_AUTO_MAG_STATUS    0x014BU  /* 磁力计状态：本轮恒 2=未接入（只读） */
 #define REG_AUTO_MAG_CAL_CMD   0x014CU  /* 磁校准命令：保留，本轮无实现 */
 #define REG_AUTO_HEATER_TARGET 0x014DU  /* 恒温目标温度(℃)，float32 需占 2 个寄存器到 0x014E */
-#define REG_AUTO_HEATER_PWM    0x014FU  /* 诊断用：当前加热 PWM 值（只读，0~5000） */
+#define REG_AUTO_HEATER_PWM    0x014FU  /* 诊断用：当前加热 PWM 值（只读，0~4500 = HEATER_PID_MAX_OUT） */
 
 /* ==================== IMU 姿态输出区 0x0150~0x015F（只读） ====================
  * 每个量为 float32，高字在前（与电机状态区同序），占 2 个寄存器。
