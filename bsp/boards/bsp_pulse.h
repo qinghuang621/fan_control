@@ -11,11 +11,11 @@
  *   - PWM3 / TIM1_CH3 -> 风机编号 3 的 FG 反馈
  *   - PWM4 / TIM1_CH4 -> 风机编号 4 的 FG 反馈
  *
- * 用法：
+ * 用法（本工程由 PulseTask 驱动，周期 10ms）：
  *   pulse_capture_init();                       // main 初始化时调用一次
- *   while(1) { pulse_poll(); ... }              // 主循环周期调用（5ms 节拍）
+ *   pulse_poll();                               // PulseTask 每 10ms 调一次
  *   uint32_t freq = pulse_get_freq_hz(1);       // 风机 1 脉冲频率 Hz
- *   uint32_t rpm  = pulse_get_rpm(1, ppr);      // 风机 1 转速 RPM
+ *   uint32_t rpm  = pulse_get_rpm(1, 2);        // 风机 1 转速 RPM（第 2 参为 PPR，现传 2）
  *   uint32_t cnt  = pulse_get_pulse_count(1);   // 风机 1 累计脉冲总数
  *
  * 硬件：白线信号线接 PWM1~PWM4 排针信号脚，GND 与开发板共地。
@@ -23,9 +23,8 @@
  */
 
 void     pulse_capture_init(void);
-void     pulse_poll(void);                    /* 主循环周期调用，500ms 窗口测频 */
+void     pulse_poll(void);                    /* 周期调用（PulseTask 10ms），内部 500ms 窗口测频 */
 
-uint8_t  pulse_is_valid(void);        /* 是否已完成过至少一次窗口测量 */
 uint32_t pulse_get_freq_hz(uint8_t channel);       /* channel: 1~4 */
 uint32_t pulse_get_rpm(uint8_t channel, uint32_t ppr);
 uint32_t pulse_get_pulse_count(uint8_t channel);

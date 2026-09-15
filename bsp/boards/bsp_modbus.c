@@ -598,19 +598,26 @@ static void refresh_fan_state_registers(void)
          * 但地址在风机独立区 0x0110 起，与 running 的电机状态区 0x0064 起互不重叠：
          * +0 ERR    : 运行标志（占空比 > 0 为 1）
          * +1 保留   : 0
-         * +2/+3 POS : FG 脉冲累计计数
+         * +2/+3 POS : FG 脉冲累计计数（float32）。
+         *             ⚠️ float32 尾数只有 24 位 → 整数只能精确到 2^24 = 16,777,216，
+         *             超过后开始丢低位（10000 RPM / PPR=2 时约 14 小时达到）。
+         *             **只作诊断，RPM(+4/+5) 不受影响**（它走窗口差分、数值很小）。
          * +4/+5 VEL : 实测转速 RPM
-         * +6/+7 T   : 当前输出占空比 0~100
-         * +8 T_MOS  : 估算 MOS 温度
-         * +9 T_Rotor: 估算转子温度
+         * +6/+7 T   : 当前输出占空比 0~100（取实际 CCR 值，不是 0x0100 寄存器值）
+         * +8 T_MOS  : **恒 0** —— 风机没有温度传感器（bsp_fric.h 只有占空比/使能接口，
+         *             无任何温度读取）。旧版用 duty*2 外推，那是**假数据**：
+         *             既与 +6/+7 冗余，又长得像温度会被误用 → 2026-09-15 改为恒 0。
+         * +9 T_Rotor: **恒 0**，原因同上（旧版 duty*3）。
          */
         s_holding_regs[status_base + 0U] = (uint16_t)(duty > 0U ? 1U : 0U);
         s_holding_regs[status_base + 1U] = 0U;
         write_float32_le(s_holding_regs, status_base + 2U, (float)pulse_cnt);
         write_float32_le(s_holding_regs, status_base + 4U, (float)rpm);
         write_float32_le(s_holding_regs, status_base + 6U, (float)duty);
-        s_holding_regs[status_base + 8U] = (uint16_t)(duty * 2U);
-        s_holding_regs[status_base + 9U] = (uint16_t)(duty * 3U);
+        /* +8/+9 恒 0：风机无温度通道。留 0 而不是留"外推值"——
+         * 0 一眼就知道"没这个数据"，而 80/120 会被当成真值（比如误做过热保护）。 */
+        s_holding_regs[status_base + 8U] = 0U;
+        s_holding_regs[status_base + 9U] = 0U;
     }
 }
 
@@ -723,9 +730,11 @@ static void fan_auto_update(void)
     if ((mode == 2U) && (s_holding_regs[REG_LUT_MAGIC] == REG_LUT_MAGIC_VAL))
     {
         /* ---- 查表模式 ----
-         * 魔数不匹配时**自动回退线性模型**，绝不输出 0：
-         * 未标定时整张表是 0，直接驱动会让吸附力归零、小车掉壁。
-         * 这是设计上的安全阀，"写了表但不写魔数 → 不生效"是有意为之。 */
+         * 魔数不匹配时**自动回退线性模型**，目的是挡住"未标定（或写坏）的表"。
+         * ⚠️ 注意它**不是"防空输出"**：即使魔数有效而 13 格全填 0，插值结果也会被
+         * 下面的 `DUTY_MIN` 钳位抬到 30，不会输出 0。魔数的语义是"别信这张表"。
+         * （早期文档/注释写成"全 0 表 → duty=0 → 掉壁"，那是错的，09-15 已改正。）
+         * "写了表但不写魔数 → 不生效"是有意为之。 */
         if (cos_theta < -1.0f) { cos_theta = -1.0f; }
         if (cos_theta >  1.0f) { cos_theta =  1.0f; }
         theta_deg = acosf(cos_theta) * LUT_RAD2DEG;

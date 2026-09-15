@@ -7,15 +7,20 @@
  * 设计要点（防御性，避免旧版跑飞问题）：
  *  1. 只使能 CC1~CC4 捕获中断，不使用 TIM1 更新中断
  *  2. 中断回调只做对应通道脉冲计数 +1，不做任何计算
- *  3. 频率用主循环 500ms 窗口内计数差计算，无需溢出补偿
- *  4. CC2 加输入滤波，抗信号毛刺
+ *  3. 频率用 500ms 窗口内的计数差计算（PulseTask 每 10ms 调 pulse_poll() 来判窗口），
+ *     **不依赖定时器溢出补偿** —— s_pulse_count 是 uint32，回绕后差值仍正确
+ *     （C 无符号减法是模 2^32 运算）
+ *  4. CC1~CC4 四个通道都加了输入滤波（CCMR 里 ICxF=3），抗信号毛刺
  *
- * RPM = 频率(Hz) × 60 ÷ 每转脉冲数(PPR)，PPR 由上位机 PPRn 命令设定（存 usbd_cdc_if.c）
+ * RPM = 频率(Hz) × 60 ÷ 每转脉冲数(PPR)。
+ * ⚠️ PPR 目前由调用方**硬编码为 2**（`bsp_modbus.c::refresh_fan_state_registers()`）。
+ *    若实际风机的每转脉冲数不是 2，RPM 会整体错一个倍数，且没有自检手段。
+ *    （旧注释曾写"PPR 由上位机 PPRn 命令设定（存 usbd_cdc_if.c）"——
+ *      那是 USB CDC 时代的做法，该文件早已不参与编译，注释已作废。）
  */
 
 static volatile uint32_t s_pulse_count[4];
 static volatile uint32_t s_freq_hz[4];
-static volatile uint8_t  s_have_freq[4];
 
 void pulse_capture_init(void)
 {
@@ -23,7 +28,6 @@ void pulse_capture_init(void)
     {
         s_pulse_count[i] = 0;
         s_freq_hz[i] = 0;
-        s_have_freq[i] = 0;
     }
 
     /* TIM1 已由 CubeMX MX_TIM1_Init() 配置（IC CH2 + GPIO）。
@@ -62,7 +66,7 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
     }
 }
 
-/* 主循环周期调用（5ms 节拍即可），内部按 500ms 窗口计算频率 */
+/* 周期调用（PulseTask 每 10ms），内部按 500ms 窗口计算频率 */
 void pulse_poll(void)
 {
     static uint32_t last_cnt[4] = {0};
@@ -82,16 +86,10 @@ void pulse_poll(void)
         {
             uint32_t delta_c = s_pulse_count[i] - last_cnt[i];
             s_freq_hz[i] = (delta_c * 1000u) / delta_t;
-            s_have_freq[i] = 1;
             last_cnt[i] = s_pulse_count[i];
         }
         last_tick = now;
     }
-}
-
-uint8_t pulse_is_valid(void)
-{
-    return s_have_freq[0] && s_have_freq[1] && s_have_freq[2] && s_have_freq[3];
 }
 
 uint32_t pulse_get_freq_hz(uint8_t channel)
