@@ -30,3 +30,6 @@ __pycache__/
 
 # WorkBuddy agent workspace (project memory, not part of firmware)
 .workbuddy/
+
+# 个人进展 / 待办笔记（2026-09-16 起仅本地保留，不再入库）
+计划.md

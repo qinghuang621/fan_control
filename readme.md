@@ -13,7 +13,7 @@
 
 硬件平台：**STM32F407IGH6**（UFBGA176 封装，1 MB Flash / 128 KB SRAM + 64 KB CCMRAM）——
 以 `.ioc` 的 `Mcu.CPN` 与 `STM32F407xx_FLASH.ld` 的存储器布局为准。
-软件架构：FreeRTOS 多任务（`ModbusTask` / `FanTask` / `PulseTask` / `LedTask`），1 ms HAL 时基（TIM6）+ FreeRTOS SysTick 节拍（`xPortSysTickHandler`），Cortex-M4F 168 MHz。
+软件架构：FreeRTOS **5 个任务**（`ModbusTask` / `FanTask` / `InsTask` / `PulseTask` / `LedTask`），1 ms HAL 时基（TIM6）+ FreeRTOS SysTick 节拍（`xPortSysTickHandler`），Cortex-M4F 168 MHz。
 
 ### 参考资料
 
@@ -103,14 +103,19 @@
   - 是否参与构建，以 `cmake/stm32cubemx/CMakeLists.txt` 的源文件清单为准（第 62~63 行有说明）。
   - 固件体积从 56 KB 降到 31.7 KB。
 
-## 3. 软件架构（FreeRTOS 4 任务）
+## 3. 软件架构（FreeRTOS 5 任务）
 
 | 任务 | 周期 | 优先级 | 职责 |
 |------|------|--------|------|
-| ModbusTask | 5 ms | +4 | RS485 帧解析（裸寄存器中断收发）、Modbus 03/06/10/04 协议、CAN 电机发送（HAL API）、CAN 接收队列排空、心跳超时、参数落盘 |
-| FanTask    | 5 ms | +3 | 风机占空比斜坡、PWM 输出更新 |
+| ModbusTask | 5 ms | +4 | RS485 帧解析（裸寄存器中断收发）、Modbus 03/06/10/04 协议、**风机占空比输出**（自动前馈 / 手动跟随）、CAN 电机发送（HAL API）、CAN 接收队列排空、心跳超时、参数落盘 |
+| FanTask    | 5 ms | +3 | 调 `fan_tick()` —— ⚠️ **当前为空转**：它驱动的斜坡状态机（`bsp_fric.c`）恒为 `IDLE`，因为 `fan_set_target()` / `fan_stop()` **全工程无人调用**。风机输出实际由 ModbusTask 完成 |
+| InsTask    | ~1 ms（DRDY 驱动）| +3 | BMI088 采样 → Mahony 姿态解算 → 发布 seqlock 快照；恒温 PID（TIM10）；栈 512 字（含 sqrt/atan2 浮点库调用） |
 | PulseTask  | 10 ms| +2 | 500 ms 窗口 FG 测频、RPM 计算 |
 | LedTask    | 5 ms | +1 | RGB 倾斜指示灯（色相=倾斜方向，饱和度=幅度，亮度=系统状态） |
+
+> ⚠️ **风机输出的真实路径**：`ModbusTask` → `modbus_poll()` → `fan_auto_update()`（自动模式，
+> 每 5 ms 算一次并直接写 TIM8 CCR）/ `sync_fan_outputs_from_regs()`（手动模式，跟随 `0x0100~0x0103`）。
+> **不要以为是 FanTask 在输出** —— 它那套斜坡逻辑目前没有被接上。
 
 时基分工（与 `running` 对齐）：
 
@@ -133,13 +138,15 @@
 | 0x0100~0x0103 | 风机 1~4 占空比 0~100（手动）| R/W |
 | 0x0110~0x0137 | 风机 1~4 状态区（每块 10 寄存器，固件每 5 ms 刷新）| R |
 | 0x0140~0x014F | 风机自动模式参数（姿态前馈）| R/W |
-| 0x0150~0x015F | IMU 姿态输出（欧拉角 / 陀螺 / 状态 / 温度）| R |
+| 0x0150~0x015F | IMU 姿态输出（欧拉角 / 陀螺 / **`0x015C` 自动前馈占空比** / 状态 / 温度）| R |
 | 0x0160~0x016C | 风机查表 `LUT[0..12]`（θ = 0°,15°,…,180°）| R/W |
 | 0x016D | LUT 魔数（`0xA5C3` = 表有效）| R/W |
 | 0x016E~0x016F | 实时总倾角 θ（float32）| R |
+| 0x0170~0x0173 | 保持区尾部保留（恒 0）| R |
 | 0x0174~0x017B | 姿态四元数（4×float32，w/x/y/z）| R |
 
-> **断电保持区 = `0x0090~0x0173` 整段**（2026-09-15 由 `0x0090~0x00BF` 扩展，`VERSION` 升为 2）。
+> **断电保持区 = `0x0090~0x0173` 整段**（2026-09-15 由 `0x0090~0x00BF` 扩展；
+> 2026-09-16 修复"CRC 把自身算进校验范围"导致**断电保持从未生效**的 bug，`VERSION` 升为 **3**，见 `接口文档.md` §7.3）。
 > 四元数（`0x0174~0x017B`）**刻意放在保持区之外** —— 它是每 5 ms 刷新的实时量，持久化没有意义。
 
 **Modbus 功能码支持**：0x03（读保持寄存器）、0x04（读输入寄存器，复用 0x03 语义）、0x06（写单寄存器）、0x10（写多寄存器）。
@@ -188,13 +195,29 @@
 
 ## 7. 风机控制
 
-`FanTask` 每 5 ms 读 `0x0100~0x0103`，截断到 0~100 后通过 TIM8 CH1~CH3 输出 20 kHz PWM：
+**PWM 输出（20 kHz，TIM8；`PSC=83 / ARR=99` → 168 MHz / 84 / 100 = 20 kHz）**：
 
 - 风机 1 → PWM5 (TIM8_CH1, PC6)
 - 风机 2 → PWM6 (TIM8_CH2, PI6)
 - 风机 3 + 风机 4 → PWM7 (TIM8_CH3, PI7)，取两者较大值
 
-`PulseTask` 每 10 ms 累计 FG 脉冲，每 500 ms 窗口计算 RPM，通过 `pulse_get_freq_hz()` / `pulse_get_rpm()` / `pulse_get_pulse_count()` 读取（来自 `bsp/boards/bsp_pulse.c`）。
+**占空比的来源有两条路，都在 `ModbusTask` 里每 5 ms 执行一次**（`modbus_poll()`，**不是 FanTask**）：
+
+| 模式 | 条件 | 输出 |
+|---|---|---|
+| **手动** | `0x0140 = 0` **或** `0x0141 = 0` | `sync_fan_outputs_from_regs()` —— 直接跟随 `0x0100~0x0103`（截断 0~100）|
+| **自动·姿态前馈** | `0x0140 ≠ 0` **且** `0x0141 = 1` | `fan_auto_update()` —— 由 roll/pitch 算出单值，四路同值直写 CCR |
+| ⚠️ **自动，但 IMU 未就绪** | 同上，且 `0x015E ≠ 2` | 输出 **θ=0° 档位**（查表 → `DUTY_LUT[0]`；线性 → `DUTY_FLAT`），保证预热期有基础吸附 |
+
+前馈的两套模型与标定见 `标定手册.md` §3（线性，仅 [0°,90°]）与 §8（LUT，覆盖 [0°,180°]）。
+当前占空比读 `0x015C`（`AUTO_DUTY`，float32）。
+
+> ⚠️ **`FanTask` 目前不参与输出** —— 它只调 `fan_tick()`，而那个斜坡状态机恒为 `IDLE`
+> （`fan_set_target()` / `fan_stop()` 全工程无人调用）。**别被任务名误导。**
+
+**FG 测速**：`PulseTask` 每 10 ms 累计 FG 脉冲，每 500 ms 窗口算 RPM，通过
+`pulse_get_freq_hz()` / `pulse_get_rpm()` / `pulse_get_pulse_count()` 读取（`bsp/boards/bsp_pulse.c`）。
+⚠️ **PPR 硬编码为 2**、RPM 分辨率约 **60 RPM**，详见 `接口文档.md` §6.2。
 
 ## 8. 构建与烧录
 
@@ -205,7 +228,21 @@ cmake --preset Debug
 cmake --build build/Debug -- -j 8
 ```
 
-产物：`build/Debug/pwm_snail.{elf,hex,bin}`，当前约 32 KB Flash / 28 KB RAM。烧录工具按 C 板使用 ST-Link 即可（`openocd.cfg` 与 `.vscode/tasks.json` 里有现成的构建 / 烧录 / 调试任务）。
+产物：`build/Debug/pwm_snail.{elf,hex,bin}`，当前约 **74 KB Flash / 29 KB RAM**
+（`RAM 29848 B (22.77%) / FLASH 75436 B (7.19%)`）。烧录用 ST-Link 即可
+（`openocd.cfg` 与 `.vscode/tasks.json` 里有现成的构建 / 烧录 / 调试任务）。
+
+**工具链现状（2026-09-15 起）** —— 三个组件都是独立安装的，**不需要 STM32CubeIDE**：
+
+| 组件 | 位置 | 备注 |
+|---|---|---|
+| CMake 4.3.3 | `D:\ST\bin\cmake.exe` | ⚠️ **不在 PATH 里**，需用绝对路径或自行加 PATH |
+| Ninja 1.13.2 | `D:\stm32\nijia\ninja.exe` | 目录名就是 "nijia"（非笔误）|
+| arm-none-eabi-gcc 12.2.1 | `D:\stm32\Arm GNU Toolchain arm-none-eabi\12.2 mpacbti-rel1\bin` | 工具链文件要求它在 PATH 中 |
+
+> ⚠️ 曾出现"ninja 报 `Re-running CMake... CreateProcess failed`"——原因是 `build.ninja` 里
+> `RERUN_CMAKE` 边依赖的 CMake 模块文件随 STM32CubeIDE 一起被删了。**装回独立 CMake 后
+> `cmake --preset Debug` 会自动重生 `build.ninja`、恢复该边。**
 
 > ⚠️ **不要再用 `pwm_snail.ioc` 重新生成代码。** 该 `.ioc` 停留在移植初期：
 > 它仍勾选着已废弃的 `USB_DEVICE`（CDC），重新生成会把 `Src/usb_device.c` 等文件和一整套
@@ -226,14 +263,22 @@ cmake --build build/Debug -- -j 8
 - 1 Mbps CAN 电机控制（PD0/PD1，AF9）
 - 正交全向轮运动学解算（与 `D:\stm32\running\Core\Src\kinematics.c` 逐行一致）
 - 通信丢失保护 / NaN 防护 / 500 ms 心跳超时
-- 参数区 Flash A/B 双区断电保持，2 s 落盘防抖
+- 参数区 Flash A/B 双区断电保持，2 s 落盘防抖。
+  ⚠️ **2026-09-16 修复**：CRC 的校验范围曾把 `crc` 字段自身也算进去，导致校验恒失败、
+  **断电保持从来没有生效过**；现 `crc` 已移到镜像块末尾，`FLASH_RETENTIVE_VERSION = 3`。
+  已实机验证：写 `0x0140 = 2` → 复位 → 读回仍为 **2**。
 - IMU 六轴姿态解算（BMI088 + Mahony）+ 陀螺零偏/温度闭环。姿态输出到 `0x0150~0x015F`
-  （欧拉角/角速度/温度）、`0x016E~0x016F`（实时总倾角 θ）、**`0x0174~0x017B`（姿态四元数，
-  机体系→世界系，无万向节死锁，做算法优先用它）**
+  （欧拉角/角速度/`0x015C` 前馈占空比/状态/温度）、`0x016E~0x016F`（实时总倾角 θ）、
+  **`0x0174~0x017B`（姿态四元数，机体系→世界系，无万向节死锁，做算法优先用它）**
 - 风机自动模式：由 roll/pitch 前馈计算占空比。**两套模型**：
   `FAN_MODE=1` 线性（`duty = DUTY_FLAT + SLOPE_GAIN×(1−cosθ)`，参数区 `0x0140~0x014F`，**只适用 [0°,90°]**）；
   `FAN_MODE=2` **查表 LUT**（`0x0160~0x016D`，覆盖 θ ∈ [0°,180°]，**风洞外围爬行用这个**）。
   详见 `标定手册.md` §8。
+- **预热期的安全兜底（2026-09-16）**：自动模式下若 IMU 尚未进入 RUNNING，
+  输出 **θ=0° 档位**（而非 0），保证预热那几秒有基础吸附、且与接管后输出连续不跳变。
+  已实机验证：预热期 `0x015C` = **30.0**。
+- **恒温 PID 提前切闭环（2026-09-16）**：温度一到 `目标 − 2℃` 就交 PID，
+  不再等"连续确认达标"（原实现那段确认窗口里仍在满功率加热，实测过冲到 49℃）。
 
 剩余项（按后续计划）：
 
