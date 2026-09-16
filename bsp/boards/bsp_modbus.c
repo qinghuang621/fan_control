@@ -59,14 +59,18 @@ static volatile uint16_t s_tx_pos = 0U;
 #define FLASH_RETENTIVE_A_ADDR 0x080C0000UL
 #define FLASH_RETENTIVE_B_ADDR 0x080E0000UL
 #define FLASH_RETENTIVE_MAGIC 0x524D4352UL
-/* ⚠️ 改过 values[] 长度就必须升版本：旧镜像的 CRC 会算不过，
- * 但显式升版本更干净、也便于排查"为什么参数没恢复"。 */
-#define FLASH_RETENTIVE_VERSION 2UL
+/* ⚠️ 动过镜像块的结构（`values[]` 长度、成员顺序）就必须升版本 ——
+ * 旧镜像的 CRC 会算不过，但显式升版本更干净、也便于排查"为什么参数没恢复"。
+ *   2 = 2026-09-15 扩区（values 48 → 228）
+ *   3 = 2026-09-16 把 `crc` 成员移到末尾（修掉"断电保持从未生效"的 bug，
+ *       见 retentive_block_t 上方的说明） */
+#define FLASH_RETENTIVE_VERSION 3UL
 /* 保持区覆盖 0x0090~0x0173（连续）：48 → 228。
  * 为什么要扩（2026-09-15）：原先只保持 0x0090~0x00BF，导致 `0x0140~0x014F`（风机自动参数）
  * 与 LUT **复位即丢** → 复位后 FAN_MODE 回 0、0x0100~0x0103 回 0 → 风机全停 → 小车掉壁。
  * 顺带把手动占空比 0x0100~0x0103 也纳入了保持。
- * 块大小 = 16 字节头 + 228*2 = 472 字节（仍是 4 字节对齐，逐字烧写 118 个 word）。
+ * 块大小 = 12（magic/version/seq）+ 228*2（values）+ 4（crc）= 472 字节
+ *（4 字节对齐，逐字烧写 472/4 = 118 个 word）。
  *
  * ⚠️ 已核实：扩区**不会**造成每 5ms 写 Flash。所有每轮镜像刷新
  * （refresh_fan_state_registers / refresh_imu_registers / modbus_poll 里的 0x014D/4E/4F）
@@ -259,13 +263,32 @@ static uint32_t s_param_dirty_tick_ms = 0U;
 static uint32_t s_retentive_seq = 0U;
 static uint8_t s_retentive_bank = 0U;
 
+/* 断电保持镜像块。
+ *
+ * ⚠️⚠️ **`crc` 必须是最后一个成员，不要往上挪！**
+ * 读/写两侧都用同一个式子算校验：
+ *     crc32_buffer(buf, sizeof(retentive_block_t) - sizeof(crc))
+ * 它**从结构体起始**算，长度只减去 4 字节 —— 也就是说，它假定 crc 在**末尾**。
+ * 若把 crc 排在 values 之前，这个范围就会**把 crc 字段自己也圈进去**：
+ * 写入时该字段还是 0（block = {0}），读回来时它已是存下的校验值 →
+ * 两侧输入不同 → 结果必然不同 → 校验恒失败 → `retentive_read_block()` 恒返回 0
+ * → **两个 bank 都被判无效，参数永远加载不回来（每次上电都回默认值）**。
+ *
+ * 这个 bug 从最初实现就一直存在，2026-09-16 实测"复位后 0x0140 变回 0"才暴露；
+ * 当时 crc 排在 seq 之后、values 之前（offset 12），用脚本复现：
+ * 写入算出 0x44014D4C、读回算出 0x8A619BCC。
+ *
+ * 当前布局（与上面的式子自洽）：
+ *     magic(4) + version(4) + seq(4) + values(456) + crc(4) = 472
+ *       offset 0            12            468       末尾
+ */
 typedef struct
 {
     uint32_t magic;
     uint32_t version;
     uint32_t seq;
-    uint32_t crc;
     uint16_t values[FLASH_RETENTIVE_PARAM_COUNT];
+    uint32_t crc;                    /* ← 必须留在最后，见上方说明 */
 } retentive_block_t;
 
 /* ---- 编译期断言：把"必须同步修改"的几个常量钉死 ----
@@ -276,7 +299,7 @@ typedef struct
  *
  * 断言内容：
  *   ① 结构体真实大小 == FLASH_RETENTIVE_BLOCK_SIZE
- *      （= 16 字节头 + PARAM_COUNT×2）
+ *      （= 12 + PARAM_COUNT×2 + 4 = 472；12 = magic/version/seq，4 = crc）
  *   ② 保持区寄存器范围 [REG_PARAM_BASE, REG_PARAM_BASE+PARAM_COUNT-1]
  *      必须正好结束于 REG_RETENTIVE_END —— 否则 is_param_region() 与
  *      实际落盘的寄存器范围不一致，会出现"能写但不落盘"或"落盘了但只读得回一半"。
@@ -673,6 +696,22 @@ static float fan_lut_interp(float theta_deg)
     return a + (b - a) * (pos - (float)i);
 }
 
+/* 取"θ = 0°（水平）时的档位"，用于 IMU 尚未收敛期间（预热窗口）的安全兜底。
+ * 两种模式各取其 θ=0 的基准值，天然自洽：
+ *   - 查表模式（mode==2 且魔数有效）→ `DUTY_LUT[0]`（出厂 30）
+ *   - 线性模式 → `DUTY_FLAT`（线性式在 θ=0 时 (1−cosθ)=0，输出恰为 DUTY_FLAT）
+ * ⚠️ 这不是"防空输出"：调用方还会过 DUTY_MIN/DUTY_MAX 钳位。
+ * ⚠️ 与 `DUTY_LUT` **联动** —— 以后标定改了表，兜底值自动跟着变，不必改两处。 */
+static uint16_t fan_duty_theta0(void)
+{
+    if ((s_holding_regs[REG_AUTO_FAN_MODE] == 2U) &&
+        (s_holding_regs[REG_LUT_MAGIC] == REG_LUT_MAGIC_VAL))
+    {
+        return s_holding_regs[REG_LUT_BASE];
+    }
+    return s_holding_regs[REG_AUTO_DUTY_FLAT];
+}
+
 static void fan_auto_update(void)
 {
     ins_snapshot_t snap;
@@ -682,28 +721,49 @@ static void fan_auto_update(void)
     uint16_t duty_min, duty_max, mode;
     uint16_t out;
 
-    /* 只有"自动模式 + 总开关打开"才接管；否则沿用 0x0100 的手动值 */
+    /* 手动模式（或自动总开关关闭）：`0x0100~0x0103` 是唯一真值来源，直接推给硬件。
+     * ⚠️ **必须在启动后也走到这一句** —— `sync_fan_outputs_from_regs()` 以前只在上位机
+     * 写入 `0x0100~0x0103` 时被调用，于是断电保持恢复出来的手动值只落在寄存器数组里、
+     * **永远不会驱动风机**。（2026-09-16 修：这正是"手动通道从未真正生效"的原因。） */
     mode = s_holding_regs[REG_AUTO_FAN_MODE];
     if ((mode == 0U) || (s_holding_regs[REG_AUTO_FAN_AUTO_EN] == 0U))
     {
         fan_auto_duty = 0U;
+        sync_fan_outputs_from_regs();
         return;
     }
 
-    /* ⚠️ IMU 未进入 RUNNING 之前**不接管**，让 0x0100~0x0103 的手动值生效。
+    /* ⚠️ IMU 未进入 RUNNING 之前**不接管姿态前馈**。
      * 为什么必须有这道门：InsTask 在 WARMUP 期间以 `while (!s_first_temperate)`
      * 阻塞轮询、**根本不调用 publish_snapshot()**，而 s_snap_seq 初值为 0（偶数）→
      * INS_get_snapshot() 会**返回"成功"但给出全 0 的快照** → 本函数算得 pitch=roll=0
-     * → θ=0 → 输出"水平档"占空比。该窗口上限 INS_TEMP_BOOT_TIMEOUT_MS = **20 秒**
-     * （且因加热功率不足，实际大概率跑满超时而不是温度达标）。
-     * 若小车停在侧壁上时板子复位（掉电/看门狗/EMI/手按复位），这 20 秒会把它吹下来。
+     * → θ=0 → 输出"水平档"占空比。该窗口**上限** INS_TEMP_BOOT_TIMEOUT_MS = 20 秒（超时兜底），
+     * **24V 正常供电下实际约 3.5 秒**（升温 ~2 s + 确认 30×50ms = 1.5 s）。
+     * （2026-09-16 更正：早期用 USB 供电时加热功率不足、温度只能到 ~34℃（低于 45℃ 目标），
+     *   才被迫跑满 20 秒超时 —— 那是**供电问题**，不是加热电路问题；24V 下 2 秒即达 45℃。）
      *
-     * 回退到手动通道即可自保：只要事先把 0x0100~0x0103 写成高位值
-     * （该值 2026-09-15 起已随断电保持一起持久化）。地上开机时它是 0 → 风机不转，
-     * 等 RUNNING 后自动接管，行为不意外。 */
+     * 这段时间输出什么？—— **输出 θ=0 的档位**（`fan_duty_theta0()`）：
+     *   - 为什么不给 0：上电后 `MX_TIM8_Init()` 会把 CCR 清零，若这里再不管，预热期风机
+     *     **完全没有驱动**；给水平档至少提供基础吸附，且与接管后的输出连续、不跳变。
+     *   - 为什么不给 100（按最坏工况配置）：那会让**台面上电时预热数秒满档狂吹**。
+     *     "壁上复位→滑落"属小概率工况（长老 2026-09-16 判断：一般不会在 180° 倒立工况下
+     *     复位），不值得用"每次都吵"去换。
+     *   - 结论：**壁上复位救不了当下**，只能救"复位之后不必重新配置"。
+     *   - 想人工抬高兜底值：改 `DUTY_LUT[0]` 即可（本兜底与表联动，无需改代码）。 */
     if (ins_get_status() != INS_STATUS_RUNNING)
     {
-        fan_auto_duty = 0U;
+        uint16_t d    = fan_duty_theta0();
+        uint16_t dmin = s_holding_regs[REG_AUTO_DUTY_MIN];
+        uint16_t dmax = s_holding_regs[REG_AUTO_DUTY_MAX];
+
+        if (d < dmin) { d = dmin; }
+        if (d > dmax) { d = dmax; }
+        if (d > 100U) { d = 100U; }
+
+        fan_auto_duty = d;
+        fric_set_channel_duty(1U, (uint8_t)d);
+        fric_set_channel_duty(2U, (uint8_t)d);
+        fric_set_channel_duty(3U, (uint8_t)d);
         return;
     }
 
@@ -775,6 +835,14 @@ static void refresh_imu_registers(void)
      * 否则"卡在 WARMUP"时上位机看到的状态是陈旧的，无法定位。 */
     s_holding_regs[REG_IMU_STATUS] = (uint16_t)ins_get_status();
 
+    /* ⚠️ AUTO_DUTY 也必须放在快照读之前 —— 它同样属于"读失败也要能看到的诊断量"。
+     * 原先它排在 `INS_get_snapshot()` 的提前 return 之后，理由与本行上方完全矛盾：
+     * 状态量都容忍读失败，而"风机现在到底吹多少"这个最该被看到的量却不容忍。
+     * 后果：seqlock 一抖动，0x015C 就停更（表现为读数冻结在上一次的值）。
+     * ⚠️ 注意它必须在 `fan_auto_update()` 之后调用才有意义 —— 调用点在 modbus_poll() 里
+     * 紧跟 fan_auto_update()，顺序已保证。 */
+    write_float32_le(s_holding_regs, REG_IMU_AUTO_DUTY, (float)fan_auto_duty);
+
     if (!INS_get_snapshot(&snap))
     {
         return;   /* 姿态数据正在更新，下轮再来 */
@@ -786,7 +854,6 @@ static void refresh_imu_registers(void)
     write_float32_le(s_holding_regs, REG_IMU_GYRO_X,   snap.gyro_x);
     write_float32_le(s_holding_regs, REG_IMU_GYRO_Y,   snap.gyro_y);
     write_float32_le(s_holding_regs, REG_IMU_GYRO_Z,   snap.gyro_z);
-    write_float32_le(s_holding_regs, REG_IMU_AUTO_DUTY, (float)fan_auto_duty);
 
     /* 实时总倾角 θ = acos(cos(pitch−off)·cos(roll−off))，单位度，范围 0~180。
      * **专为 LUT 标定加的**：标定时需要知道"现在摆到几度了"，
@@ -1365,6 +1432,14 @@ static void modbus_write_single_register(uint16_t addr, uint16_t value)
         {
             sync_fan_outputs_from_regs();
         }
+        /* ⚠️ 必须在这里显式置脏标志：本分支**提前 return**，走不到函数末尾那段
+         * "if (is_param_region(addr)) s_param_dirty = 1U"。
+         * 2026-09-16 之前一直漏了 → 手动占空比**从不落盘**，复位后回 0
+         *（实测：0x0140 能保持、0x0100~0x0103 不能）。
+         * 与 2026-09-15 修的自动参数区是**同一个坑**，只是漏在了另一个分支上。
+         * 通用判据：**写路径里凡是有 return 的分支，都要自己确认它覆盖的地址是否落在保持区。** */
+        s_param_dirty = 1U;
+        s_param_dirty_tick_ms = HAL_GetTick();
         return;
     }
 

@@ -114,6 +114,26 @@ static float s_temp     = 0.0f;
  * 与例程的 first_temperate 同名同义。 */
 static uint8_t s_first_temperate = 0U;
 
+/* 闭环 PID 是否已接管加热（latch，置位后不再清零）。
+ * ⚠️ 与 s_first_temperate 是**两个独立的事件**，别混用：
+ *   - 本标志 = "温度已接近目标，可以交给 PID 调制了"      → 决定**加热方式**
+ *   - s_first_temperate = "连续确认达标，可以对外发快照了" → 决定**对外数据是否可用**
+ * 旧实现把两者绑在一起（等 s_first_temperate 才切 PID），导致那 1.5 s 确认窗口
+ * 在已经超过目标温度的情况下仍满功率加热，实测过冲到 49℃。见 ins_task.h 的说明。 */
+static uint8_t s_heater_pid_active = 0U;
+
+/* 让闭环 PID 接管加热（幂等）。
+ * 预置积分项 = 半量程，使 PID 直接站在工作点附近，免去 Iout 从 0 慢慢爬
+ * （那期间 Kp=1600 会让系统剧烈振荡）。 */
+static void heater_pid_engage(void)
+{
+    if (s_heater_pid_active == 0U)
+    {
+        s_heater_pid_active = 1U;
+        s_heater_pid.Iout = HEATER_PID_MAX_OUT / 2.0f;
+    }
+}
+
 #define RAD_TO_DEG  57.29577951308232f
 
 /* ============================ 内部辅助 ============================ */
@@ -382,42 +402,58 @@ static void imu_temp_control(float temp)
         boot_tick = now;
     }
 
-    if (s_first_temperate)
+    /* ================= 一、加热控制 =================
+     * 温度一升到 `目标 − INS_TEMP_PID_ENGAGE_MARGIN` 就交闭环 PID。
+     * ⚠️ 这里**不能**等 s_first_temperate —— 达标要连续确认 30 次（1.5 s），
+     * 而那段确认窗口里温度已经超过目标，旧实现却仍在满功率加热
+     *（"温度 > 目标"只是累加计数，随后照样落到 `s_heater_pwm = MAX_OUT - 1` = 90%），
+     * 实测因此过冲到 49℃ 才停。加热方式与"何时对外发快照"必须解耦。 */
+    if (temp >= (s_target_temp - INS_TEMP_PID_ENGAGE_MARGIN))
+    {
+        heater_pid_engage();
+    }
+
+    if (s_heater_pid_active != 0U)
     {
         PID_calc(&s_heater_pid, temp, s_target_temp);
         if (s_heater_pid.out < 0.0f)
         {
+            /* 超温：P 项为负，直接停加热（本电路没有制冷手段，只能等自然散热） */
             s_heater_pid.out = 0.0f;
         }
         s_heater_pwm = (uint16_t)s_heater_pid.out;
-        imu_pwm_set(s_heater_pwm);
-        return;
-    }
-
-    /* ---- 尚未达标：满功率加热 ---- */
-    if (temp > s_target_temp)
-    {
-        if (++temp_constant_time > INS_TEMP_CONFIRM_CNT)
-        {
-            s_first_temperate = 1U;
-            s_heater_pid.Iout = HEATER_PID_MAX_OUT / 2.0f;
-        }
     }
     else
     {
-        temp_constant_time = 0U;
+        /* 距目标还远：开环满功率（4499/4999 = 90%） */
+        s_heater_pwm = (uint16_t)(HEATER_PID_MAX_OUT - 1.0f);
+    }
+    imu_pwm_set(s_heater_pwm);
 
-        /* 时间兜底：按调用次数累加在 accel_temp 更新率不稳定时会失效，
-         * 所以改用 tick 判据。 */
-        if ((now - boot_tick) * portTICK_PERIOD_MS > INS_TEMP_BOOT_TIMEOUT_MS)
+    /* ================= 二、达标判定 =================
+     * 只决定"何时开始对外发姿态快照"，不参与加热控制（加热已在上面独立完成）。 */
+    if (s_first_temperate == 0U)
+    {
+        if (temp > s_target_temp)
         {
-            s_first_temperate = 1U;
-            s_heater_pid.Iout = HEATER_PID_MAX_OUT / 2.0f;
+            if (++temp_constant_time > INS_TEMP_CONFIRM_CNT)
+            {
+                s_first_temperate = 1U;
+            }
+        }
+        else
+        {
+            temp_constant_time = 0U;
+
+            /* 时间兜底：按调用次数累加在 accel_temp 更新率不稳定时会失效，
+             * 所以改用 tick 判据。 */
+            if ((now - boot_tick) * portTICK_PERIOD_MS > INS_TEMP_BOOT_TIMEOUT_MS)
+            {
+                heater_pid_engage();
+                s_first_temperate = 1U;
+            }
         }
     }
-
-    s_heater_pwm = (uint16_t)(HEATER_PID_MAX_OUT - 1.0f);
-    imu_pwm_set(s_heater_pwm);
 }
 
 /* ============================ 任务主体 ============================ */
@@ -500,8 +536,10 @@ uint8_t ins_init(void)
             elapsed_ms = (uint32_t)((xTaskGetTickCount() - t0) * portTICK_PERIOD_MS);
             if (elapsed_ms > INS_TEMP_BOOT_TIMEOUT_MS)
             {
+                /* 超时兜底：强制收束。若 PID 尚未接管（例如温度始终上不去），
+                 * 这里补一次 engage，免得退出预热后还停在开环满功率。 */
+                heater_pid_engage();
                 s_first_temperate = 1U;
-                s_heater_pid.Iout = HEATER_PID_MAX_OUT / 2.0f;
                 break;
             }
             vTaskDelay(pdMS_TO_TICKS(50));
