@@ -17,10 +17,21 @@
 
 #define MODBUS_SLAVE_ADDR 0x01U
 #define MODBUS_RX_RING_SIZE 128U
-/* 帧间静默超时（ms）：Modbus RTU 用 3.5 字符间隔分帧。
- * 115200 8N1 下一个字符约 87us，3.5 字符 ≈ 305us；取 4ms 留足余量，
- * 远小于上位机默认 1000ms 扫描周期，不会误切正常帧。用来丢弃残缺帧。 */
-#define MODBUS_FRAME_GAP_MS 4U
+/* ---- Modbus RTU 帧间隔 T3.5：口径与 DJI 例程 running 的 FreeModbus 完全一致 ----
+ * running 在 FreeModbus 的 mbrtu.c::eMBRTUInit() 里这样算：
+ *     baud >  19200 → T3.5 = 1750 µs              （规范对高速率的固定值）
+ *     baud <= 19200 → T3.5 = 38500000 / baud µs   （= 3.5 字符 × 11 bit/字符）
+ * 本工程用 HAL_GetTick() 计时（1 ms 粒度），故算出后**向上取整到 ms**，
+ * 保证不小于规范值（115200 → 1.75 ms → 取 2 ms；9600 → 4.01 ms → 取 5 ms）。
+ *
+ * ⚠️ 数值对齐 ≠ 行为对齐：running 用 TIM7 硬件定时器在【中断】里逐字节重置、
+ *    微秒级判定；本工程判定点在 modbus_poll() **末尾**（5 ms 轮询周期）。
+ * 用途也不同：running 靠 T3.5 判定"一帧接收完毕、可以处理了"；本工程不靠超时
+ *    分帧（靠"字节数够 + CRC 通过"判定帧完整），T3.5 只用于**丢弃残缺帧**。
+ *    → 所以两边超时值相同，不代表两边"分帧行为"相同，只是口径统一、便于对比排查。
+ * 实现见 modbus_t35_gap_ms()，在 modbus_init() 里按实际波特率算一次。 */
+#define MODBUS_T35_FIXED_US  1750UL
+#define MODBUS_T35_DIVISOR   38500000UL
 
 /* ==================== RS485 底层：裸寄存器 + 自管中断 ====================
  * 与 running 的 Middlewares/Third_Party/FreeModbus/modbus/port/portserial.c 对齐：
@@ -171,6 +182,20 @@ static const uart_cfg_t *uart_cfg_lookup(uint16_t idx)
     return &s_uart_cfg_table[idx];
 }
 
+/* T3.5 帧间隔，单位 ms。口径见文件头 MODBUS_T35_FIXED_US 处说明（与 running 一致）。
+ * 向上取整：宁可略大于规范值 —— 取小了会把间隔正常的两个字节误判为"帧已断"，
+ * 取大一点最坏也只是多留几十微秒的残缺字节，而残缺帧最终仍会被 CRC 挡掉。 */
+static uint32_t modbus_t35_gap_ms(uint32_t baud)
+{
+    uint32_t us;
+    if (baud == 0U)
+    {
+        return 1U;
+    }
+    us = (baud > 19200UL) ? MODBUS_T35_FIXED_US : (MODBUS_T35_DIVISOR / baud);
+    return (us + 999UL) / 1000UL;
+}
+
 /* ==================== 风机自动模式（姿态前馈）参数区 0x0140~0x014F ====================
  * 风机占空比不再只由外部写 0x0100 决定，而是可以由 InsTask 依据 IMU 姿态自动生成。
  * 控制律（重力分量补偿开环前馈）：
@@ -262,6 +287,10 @@ static uint8_t s_param_dirty = 0U;
 static uint32_t s_param_dirty_tick_ms = 0U;
 static uint32_t s_retentive_seq = 0U;
 static uint8_t s_retentive_bank = 0U;
+/* T3.5 帧间隔（ms）：modbus_init() 按实际波特率算一次（见 modbus_t35_gap_ms）。
+ * 波特率只在 init 时生效（改 0x0090 需断电重启），所以不必每轮重算。
+ * 初值 2 ms 对应默认 115200（1.75 ms 向上取整）。 */
+static uint32_t s_frame_gap_ms = 2U;
 
 /* 断电保持镜像块。
  *
@@ -1702,6 +1731,9 @@ void modbus_init(void)
      * 改动下次断电重启生效（与 running 语义一致）。 */
     const uart_cfg_t *cfg = uart_cfg_lookup(s_holding_regs[REG_PARAM_UART_CFG]);
     MX_USART6_RS485_UART_Init_With(cfg->baud, cfg->parity);
+    /* 帧间隔 T3.5 随波特率变化（>19200 固定 1750µs；<=19200 按 38500000/baud）。
+     * 与上面同一处算，保证"实际使用的波特率"和"超时值"永远配套。 */
+    s_frame_gap_ms = modbus_t35_gap_ms(cfg->baud);
 
     /* 接收中断由我们自管（不经过 HAL），先确保 RXNE/TC/TXE 都关，清残留标志，
      * 再打开 RXNE 开始接收。HAL_UART_Init 内部已配好波特率/帧格式，此处只管中断。 */
@@ -1824,15 +1856,18 @@ void modbus_poll(void)
         }
     }
 
-    /* 帧间静默超时（Modbus RTU 的 3.5 字符间隔）。
-     * 115200 8N1 下一个字符约 87us，3.5 字符 ≈ 305us；取 4ms 留足余量，
-     * 远小于 Modbus Poll 默认 1000ms 的扫描周期，不会误切正常帧。
+    /* 帧间静默超时（Modbus RTU 的 T3.5 间隔，值由 modbus_t35_gap_ms() 按波特率算出，
+     * 口径与 running 的 FreeModbus 一致：>19200 → 1750µs，否则 38500000/baud）。
      *
      * 为什么必须加：轮询周期 5ms，一帧 8 字节传输只要约 0.7ms。
      * 若上一帧因干扰残缺（如只收到 3 字节就断了），残余会一直留在 frame 里，
      * 等下一次请求到来时与前半截拼在一起 → frame[1] 不再是功能码 → 永远 CRC 错。
-     * 有了超时，残缺帧会在下一次请求到来之前被清掉。 */
-    if ((frame_len > 0U) && ((HAL_GetTick() - last_rx_ms) > MODBUS_FRAME_GAP_MS))
+     * 有了超时，残缺帧会在下一次请求到来之前被清掉。
+     *
+     * ⚠️ 本判定紧跟在上面 while 循环之后，而 last_rx_ms 是在每次 ring_pop() 时刷新的，
+     *    所以"刚收完一批字节"时这里的时间差≈0，不会被任何阈值误清；
+     *    只有"FIFO 已空且跨了一轮 poll（≈5ms）"才会命中 —— 正是要清掉的残缺帧。 */
+    if ((frame_len > 0U) && ((HAL_GetTick() - last_rx_ms) > s_frame_gap_ms))
     {
         memset(frame, 0, sizeof(frame));
         frame_len = 0U;
