@@ -13,7 +13,8 @@ typedef struct
 {
     float roll;      /* deg, 绕 X 轴（左右翻滚），向右倾为正 */
     float pitch;     /* deg, 绕 Y 轴（前后俯仰），抬头为正 */
-    float yaw;       /* deg, 绕 Z 轴；六轴模式下会缓慢漂移，本轮仅作占位输出 */
+    float yaw;       /* deg, 绕 Z 轴；九轴(mag_active=1)时有磁北参考不累积漂移，
+                       * 六轴回退(mag_active=0)时为陀螺积分，会缓慢漂移 */
     float gyro_x;    /* rad/s, 机体坐标系 */
     float gyro_y;
     float gyro_z;
@@ -35,6 +36,14 @@ typedef struct
     float quat_x;
     float quat_y;
     float quat_z;
+
+    /* ---- IST8310 磁力计（2026-09-23 新增，同样加在结构体末尾）---- */
+    float mag_x;        /* μT，原始读数（尚未做硬铁/软铁校准） */
+    float mag_y;
+    float mag_z;
+    uint8_t mag_present;/* 硬件初始化结果：1=IST8310 在线，0=离线（回退六轴） */
+    uint8_t mag_active; /* 当前是否真正参与融合：present && 使能开关 */
+    uint8_t mag_init_err;/* ist8310_init() 返回码：0=成功，0x40=NO_SENSOR，1~4=配置校验失败 */
 } ins_snapshot_t;
 
 /* ============================ 运行状态 ============================ */
@@ -120,5 +129,16 @@ float ins_get_target_temp(void);
  * @brief  取最近一次加热 PWM 值（用于诊断）
  */
 uint16_t ins_get_heater_pwm(void);
+
+/**
+ * @brief  磁力计融合使能开关（由 Modbus 0x014A 转发）
+ *         en=1 且硬件在线时走九轴 MahonyAHRSupdate；en=0 强制六轴
+ */
+void ins_set_mag_enable(uint8_t en);
+
+/**
+ * @brief  取当前磁力计融合使能状态
+ */
+uint8_t ins_get_mag_enable(void);
 
 #endif

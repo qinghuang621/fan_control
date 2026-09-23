@@ -122,17 +122,30 @@ static const uint8_t c_cmd_clear_err[8] = {0xFFU, 0xFFU, 0xFFU, 0xFFU, 0xFFU, 0x
 #define REG_MOTOR_COUNT 4U
 /* 四轮角速度等比例限幅（rad/s）。**纯安全钳位**：NaN/Inf 已单独归零，
  * 这里只在"命令离谱"时按比例整体缩小，正常操作不该碰到它。
- * 取值依据（2026-09-11 长老要求放宽，30 → 50）：
+ * 取值依据（2026-09-11 长老要求放宽，30 → 50；2026-09-23 按实车几何更新）：
  *   1) 上位机 `D:\stm32\host` 的 Fast 档最坏组合 vx=2.0 / vy=1.2 / wz=4.0
- *      → 最大轮速 20*(2.0 + 0.075*4) = 46.0 rad/s；取 50 留余量、全程不触发限幅。
+ *      → 最大轮速 26.67*(2.0 + 0.18*4) = **72.5 rad/s** ⇒ **已超 50，会触发等比例限幅**
+ *        （缩到 50/72.5 ≈ 0.69 倍）。
+ *      ⚠️ 旧几何（LX/LY=0.15、R=0.05）下同一组合只到 46.0 rad/s、全程不触发；
+ *         新几何把自转分量放大了 2.4 倍 ⇒ **wz 比 vx/vy 更容易顶到限幅**。
  *      旧值 30 会把 Fast 档 vx 单独削到 30/40 = 0.75 倍（有效只剩 1.5 m/s）。
  *   2) 电机 DM-S2325-1EC 输出轴额定 600 rpm ≈ 62.8 rad/s，50 rad/s(≈478 rpm)
- *      仍留约 20% 余量。
- * 标定用参考值：vx=1/vy=1/wz=1 → 21.5 rad/s，离钳位很远。 */
+ *      仍留约 20% 余量。**不要为了让 Fast 档"不触发限幅"而把 W_MAX 提到 62.8 以上。**
+ * 标定用参考值：vx=1/vy=1/wz=1 → 31.5 rad/s，离钳位仍有余量。 */
 #define REG_MOTOR_W_MAX 50.0f
-#define REG_MOTOR_LX 0.15f
-#define REG_MOTOR_LY 0.15f
-#define REG_MOTOR_R 0.05f
+/* ⚠️ 量纲（与 running `Core/Src/kinematics.c` 的 KIN_LX/KIN_LY/KIN_R 同义，
+ *    那里的注释写明 "KIN_R = 轮子半径"）：
+ *      LX / LY = **轮距 / 轴距【全长】**（左右 / 前后轮中心间距），
+ *      R       = **轮子【半径】**（不是直径！）
+ *    逆运动学：w = (v ± (LX/2 或 LY/2)·wz) / R
+ * 2026-09-23 按实车实测更新：轮距 0.36 m、轮径 37.5 mm。
+ * 🔴 **待确认**：`REG_MOTOR_R` 现取 **0.0375**（= 37.5 mm 的米值）。
+ *    若"轮径 37.5 mm"指的是**直径**，则 R 应为 **0.01875**（inv_r 由 26.67 → 53.33），
+ *    **所有轮速会翻倍**。上游 commit `7ee6f031`(dev_sxj) 取的也是 0.0375。
+ *    这一点必须由长老确认后再定，见 `.workbuddy/memory/2026-09-23.md`。 */
+#define REG_MOTOR_LX 0.36f
+#define REG_MOTOR_LY 0.36f
+#define REG_MOTOR_R 0.0375f
 /* 发送邮箱满时的等待上限（tick）。configTICK_RATE_HZ = 1000，即 5ms，
  * 与 running CanTask_Send() 中 "osDelay(1) 最多 5 次" 一致 */
 #define MOTOR_CAN_TX_WAIT_TICKS 5U
@@ -215,9 +228,11 @@ static uint32_t modbus_t35_gap_ms(uint32_t baud)
 #define REG_AUTO_KP_ROLL       0x0147U  /* 横滚前馈增益（当前实现并入 SLOPE_GAIN，预留） */
 #define REG_AUTO_PITCH_OFFSET  0x0148U  /* 俯仰零位偏置(deg)，安装误差补偿 */
 #define REG_AUTO_ROLL_OFFSET   0x0149U  /* 横滚零位偏置(deg)，安装误差补偿 */
-#define REG_AUTO_MAG_ENABLE    0x014AU  /* 磁力计使能：本轮恒 0（只读，写无效） */
-#define REG_AUTO_MAG_STATUS    0x014BU  /* 磁力计状态：本轮恒 2=未接入（只读） */
-#define REG_AUTO_MAG_CAL_CMD   0x014CU  /* 磁校准命令：保留，本轮无实现 */
+#define REG_AUTO_MAG_ENABLE    0x014AU  /* 磁力计融合使能（读写，断电保持）：
+                                         * 0=强制六轴，1=允许九轴（硬件在线时生效），默认 1 */
+#define REG_AUTO_MAG_STATUS    0x014BU  /* 磁力计状态（只读，每 5ms 刷新）：
+                                         * 0=六轴运行（离线或被 0x014A 关闭），1=九轴运行 */
+#define REG_AUTO_MAG_CAL_CMD   0x014CU  /* 磁校准命令：保留，本轮无实现（写无效） */
 #define REG_AUTO_HEATER_TARGET 0x014DU  /* 恒温目标温度(℃)，float32 需占 2 个寄存器到 0x014E */
 #define REG_AUTO_HEATER_PWM    0x014FU  /* 诊断用：当前加热 PWM 值（只读，0~4500 = HEATER_PID_MAX_OUT） */
 
@@ -266,16 +281,42 @@ static uint32_t modbus_t35_gap_ms(uint32_t baud)
 #define REG_IMU_QUAT_Z     0x017AU
 #define REG_IMU_QUAT_END   0x017BU
 
+/* ==================== IST8310 磁力计诊断区 0x017C~0x0183（只读） ====================
+ * 2026-09-23 新增。与四元数区一样放在断电保持区之外（实时量，持久化无意义）。
+ * 用途：烧录后先用 modbus poll 核对磁力计链路，再谈九轴融合效果：
+ *   ① MAG_INIT_ERR=0 且 MAG_X/Y/Z 随转动合理变化 → 硬件链路通；
+ *   ② MAG_STATUS(0x014B)=1 → 九轴融合真正在跑。
+ * 磁场三轴为 IST8310 原始值×0.3（单位 μT），**未做硬铁/软铁校准**。 */
+#define REG_MAG_INIT_ERR   0x017CU  /* ist8310_init() 返回码：0=成功，0x40=WHO_AM_I 失败，
+                                     * 1~4=第 N 个配置寄存器回读校验失败 */
+#define REG_MAG_X          0x017EU  /* float32 μT，占 0x017E~0x017F */
+#define REG_MAG_Y          0x0180U  /* float32 μT，占 0x0180~0x0181 */
+#define REG_MAG_Z          0x0182U  /* float32 μT，占 0x0182~0x0183 */
+#define REG_MAG_END        0x0183U
+
 #define LUT_STEP_DEG       15.0f
 #define LUT_DEG2RAD        0.017453292519943295f
 #define LUT_RAD2DEG        57.29577951308232f
 
 /* 13 个**占位值**：由理论模型算出，**没有任何实测依据**，等小车能跑后逐点标定覆盖。
- * 模型：`N_req/mg = sinθ/μ`（θ≤90°，摩擦/下滑主导）
- *                    `= max(sinθ/μ, -cosθ)`（θ>90°，脱离壁面主导）
- *       占空比→吸力按 `N ∝ duty²`（轴流推力 ∝ 转速²）⇒ `duty ∝ √N`
- * 锚点：保留原默认值在 θ=0° 与 θ=90° 两处不变（30% / 90%），只修正中间与倒立区的形状。
- * 取 μ=0.7（橡胶/涂装面量级）。**μ≤1 时峰值落在 90°；μ>1 才移到 180°。**
+ *
+ * 模型（**2026-09-16 更正 —— 原先漏了 `-cosθ` 项**）：
+ *       N_req(θ)/mg = sinθ/μ - cosθ
+ *                     ↑ 完整不滑判据： μ(N + mg·cosθ) >= mg·sinθ
+ *       占空比->吸力：轴流推力 ∝ 转速² ⇒ N ∝ duty² ⇒ duty ∝ √N
+ *       锚点：θ=90° 处保持 90%，归一化基准 N90 = 1/μ；取 μ = 0.7（橡胶/涂装面量级）
+ *       **峰值 `θ* = 180° - arctan(1/μ)`，恒落在 (90°, 180°)**：
+ *         μ=0.5 -> 116°、**μ=0.7 -> 125°**、μ=1.0 -> 135°；反推 `μ = -1/tan(θ*)`
+ *       ⚠️ 旧口径"μ<=1 时峰值落在 90°"是**漏项模型的产物，已作废**。
+ *
+ * 🔴 **下面这 13 个值仍是【旧模型】（`max(sinθ/μ, -cosθ)`，峰值在 90°）的产物，尚未替换。**
+ *    修正模型下峰值应移到 **125° 附近**，形状也明显不同。
+ *    推荐新值（`标定手册.md` §8.9，**用 Modbus 覆盖 0x0160~0x016C 即可，固件不用改**）：
+ *        30 30 30 41 65 80 90 96 99 99 95 87 75
+ *    ⚠️ 改【这里】的默认值只在"无有效 flash 镜像"时生效（首次上电 / VERSION 不匹配 / CRC 失败）；
+ *       若保持区已有有效镜像，`retentive_load_params()` 会把它覆盖回来
+ *       —— 运行时换值请走 Modbus，别指望改这一行。
+ *
  * 生成脚本与敏感度表见 `标定手册.md` §8.9。 */
 static const uint16_t s_duty_lut_default[REG_LUT_COUNT] = {
      30U,  46U,  64U,  76U,  84U,  88U,  90U,
@@ -606,15 +647,17 @@ static uint8_t is_auto_param_region(uint16_t addr)
 
 /* IMU 姿态输出区为只读：上位机写这些地址一律静默忽略（不返回异常码，
  * 保持与既有状态区 0x0040~0x008F 相同的"写无效但不报错"行为，便于上位机统一处理）。
- * 覆盖三段：① `0x0150~0x015F` 姿态/角速度/温度；
+ * 覆盖四段：① `0x0150~0x015F` 姿态/角速度/温度；
  *          ② `0x016E~0x016F` TILT_THETA（float32 实时 θ）；
- *          ③ `0x0174~0x017B` 姿态四元数。
+ *          ③ `0x0174~0x017B` 姿态四元数；
+ *          ④ `0x017C~0x0183` IST8310 磁力计诊断（初始错误码 + 原始三轴）。
  * 这些都是每 5ms 被 refresh_imu_registers() 覆盖的实时量，允许写只会静默失效、徒增困惑。 */
 static uint8_t is_imu_status_region(uint16_t addr)
 {
     return ((addr >= REG_IMU_BASE) && (addr <= REG_IMU_END)) ||
            ((addr >= REG_IMU_THETA) && (addr <= (uint16_t)(REG_IMU_THETA + 1U))) ||
-           ((addr >= REG_IMU_QUAT_W) && (addr <= REG_IMU_QUAT_END));
+           ((addr >= REG_IMU_QUAT_W) && (addr <= REG_IMU_QUAT_END)) ||
+           ((addr >= REG_MAG_INIT_ERR) && (addr <= REG_MAG_END));
 }
 
 static uint8_t get_modbus_slave_addr(void)
@@ -907,6 +950,16 @@ static void refresh_imu_registers(void)
     write_float32_le(s_holding_regs, REG_IMU_QUAT_Y, snap.quat_y);
     write_float32_le(s_holding_regs, REG_IMU_QUAT_Z, snap.quat_z);
 
+    /* IST8310 磁力计诊断（2026-09-23）：
+     *   0x014B 融合状态（0=六轴，1=九轴），0x017C 初始化错误码，
+     *   0x017E/80/82 原始磁场三轴 μT（未校准）。 */
+    s_holding_regs[REG_AUTO_MAG_STATUS]  = (uint16_t)snap.mag_active;
+    s_holding_regs[REG_MAG_INIT_ERR]     = (uint16_t)snap.mag_init_err;
+    write_float32_le(s_holding_regs, REG_MAG_X, snap.mag_x);
+    write_float32_le(s_holding_regs, REG_MAG_Y, snap.mag_y);
+    write_float32_le(s_holding_regs, REG_MAG_Z, snap.mag_z);
+
+
     /* 温度 ×10 存为有符号整数（诊断用）。钳位到 int16 范围防溢出。 */
     temp = snap.temperature;
     t10 = (int32_t)(temp * 10.0f);
@@ -1023,7 +1076,15 @@ static void retentive_poll(void)
     {
         return;
     }
-    retentive_commit_params();
+
+    /* ⚠️ **无论成功失败，都要先刷新去抖起点**（2026-09-23 修）。
+     * retentive_commit_params() 失败时**不清 s_param_dirty**（语义上是对的：值还没落盘，
+     * 下次仍需重试），但它也不动 s_param_dirty_tick_ms —— 于是下一轮 poll（5ms 后）
+     * 算出的时间差依然 ≥ 2000，会**立刻再擦一次 128KB 扇区**。
+     * 真被触发就是"每 5ms 擦一次 Flash"的灾难模式，对寿命极不友好。
+     * 在这里刷新后，重试间隔回到 2s：既保留重试语义，又不会自毁。 */
+    s_param_dirty_tick_ms = HAL_GetTick();
+    (void)retentive_commit_params();
 }
 
 static float read_float32_regs(const uint16_t *regs, uint16_t addr)
@@ -1107,7 +1168,7 @@ static void motor_kinematics_resolve(void)
     float wz = kin_safe(read_float32_regs(s_holding_regs, REG_MOTOR_WZ_HI));
 
     /* 3. 正交全向轮逆运动学 —— 与 running kinematics.c 逐行一致
-     *    half_ly = half_lx = 0.075, inv_r = 20（KIN_LX/LY=0.15, KIN_R=0.05） */
+     *    half_ly = half_lx = 0.18, inv_r ≈ 26.67（KIN_LX/LY=0.36, KIN_R=0.0375） */
     float half_ly = REG_MOTOR_LY / 2.0f;
     float half_lx = REG_MOTOR_LX / 2.0f;
     float inv_r   = 1.0f / REG_MOTOR_R;
@@ -1476,15 +1537,22 @@ static void modbus_write_single_register(uint16_t addr, uint16_t value)
      * 让上位机调参时能立刻看到效果（不必等下一轮 poll）。 */
     if (is_auto_param_region(addr))
     {
-        /* 磁力计相关为只读/保留项：本轮强行维持固定值 */
-        if ((addr == REG_AUTO_MAG_ENABLE) ||
-            (addr == REG_AUTO_MAG_STATUS) ||
+        /* 0x014B 状态只读、0x014C 校准命令本轮未实现：写无效 */
+        if ((addr == REG_AUTO_MAG_STATUS) ||
             (addr == REG_AUTO_MAG_CAL_CMD))
         {
             return;
         }
-        /* 恒温目标温度：float32 占 2 个寄存器，由 Modbus 侧转发给 InsTask */
         s_holding_regs[addr] = value;
+        /* 0x014A 磁力计融合使能：归一化成 0/1 并立即转发给 InsTask，
+         * 下一个姿态周期即在九轴/六轴之间切换（无需重启）。 */
+        if (addr == REG_AUTO_MAG_ENABLE)
+        {
+            uint8_t en = (value != 0U) ? 1U : 0U;
+            s_holding_regs[REG_AUTO_MAG_ENABLE] = en;
+            ins_set_mag_enable(en);
+        }
+        /* 恒温目标温度：float32 占 2 个寄存器，由 Modbus 侧转发给 InsTask */
         if (addr == REG_AUTO_HEATER_TARGET)
         {
             /* 两个寄存器拼成 float32（高字在前），写完低字后再解释 */
@@ -1681,18 +1749,25 @@ void modbus_init(void)
     s_holding_regs[REG_AUTO_KP_ROLL]       = 0U;
     s_holding_regs[REG_AUTO_PITCH_OFFSET]  = 0U;
     s_holding_regs[REG_AUTO_ROLL_OFFSET]   = 0U;
-    s_holding_regs[REG_AUTO_MAG_ENABLE]    = 0U;   /* 本轮不接磁力计 */
-    s_holding_regs[REG_AUTO_MAG_STATUS]    = 2U;   /* 2 = 未接入 */
+    /* 磁力计默认使能（1）。⚠️ 老版本固件在该寄存器存的是 0，
+     * 若 flash 保持区已有旧镜像，下面 retentive_load_params() 会把它覆盖回 0，
+     * 首次升级固件后需用 Modbus 写一次 0x014A=1（之后断电保持）。 */
+    s_holding_regs[REG_AUTO_MAG_ENABLE]    = 1U;
+    s_holding_regs[REG_AUTO_MAG_STATUS]    = 0U;   /* 实时状态由 refresh 覆盖 */
     s_holding_regs[REG_AUTO_MAG_CAL_CMD]   = 0U;   /* 保留 */
 
     /* ---- 风机查表（LUT）模式默认值 ----
      * ⚠️ 这 13 个值是**理论模型算出来的占位值，没有任何实测依据**
      *（见 s_duty_lut_default 的说明与 `标定手册.md` §8.9）。
+     * 🔴 **且它们仍是【旧模型】（峰值在 90°）的产物** —— 修正模型（09-16 补上 `-cosθ`）
+     *    的峰值在 **125° 附近**，形状不同，推荐新值见 s_duty_lut_default 的注释。
      * 现在填进去是因为暂时没有大角度/倒立工装，先用模型值把链路跑通；
      * 等小车能跑后逐点标定、用 Modbus 覆盖这 13 格即可，**固件不用改**。
+     * ⚠️ 下一行的 retentive_load_params() 会用 flash 镜像**覆盖**本次赋值
+     *    （镜像有效时）→ 改这里只影响"首次上电/镜像被拒"的场景。
      *
      * 魔数一并置位，让 FAN_MODE=2 **开箱即可用**（否则要先写魔数才生效，
-     * 多一道无谓的手续）。安全上可接受：占位值全部 ≥ DUTY_MIN，
+     * 多一道无谓的手续）。安全上可接受：占位值全部 >= DUTY_MIN，
      * 即使模型不准也只是"吸力偏大/偏小"，不会出现吸附力归零。
      * 若想改成"必须显式标定后才允许查表"，把下面这行改成 = 0U 即可。 */
     for (uint16_t i = 0U; i < REG_LUT_COUNT; ++i)
@@ -1703,6 +1778,10 @@ void modbus_init(void)
 
     MX_CAN1_Init();
     retentive_load_params();
+    /* 保持区加载（可能覆盖上面的默认 1）后，把最终使能值同步给 InsTask。
+     * InsTask 虽然后面才创建，但 ins_set_mag_enable 只写静态变量，此时调用安全。 */
+    ins_set_mag_enable((uint8_t)(s_holding_regs[REG_AUTO_MAG_ENABLE] != 0U));
+
     refresh_fan_state_registers();
 
     /* CAN RX 队列 + 中断使能（与 running CanTask_Entry 一致）：
@@ -1747,16 +1826,24 @@ void modbus_poll(void)
     static uint16_t frame_len = 0U;
     static uint32_t last_rx_ms = 0U;
 
+    /* ⚠️ **必须放在本函数最前面，早于任何可能长时间占用 CPU 的操作**（2026-09-23 调序）。
+     *
+     * 原因：发送是**中断驱动**的，modbus_send_frame() 登记完就立刻返回 ——
+     * 也就是说**本函数返回之后，帧还在往线上吐**。而 ModbusTask 周期是 5ms，
+     * 一帧最长约 7.4ms（85 字节 @115200）⇒ **长帧必然跨越下一个 poll 边界**。
+     * 若把 retentive_poll()（可能擦 128KB 扇区、实测 1~2s、连中断都不响应）
+     * 或 motor_can_tick() 排在这一行**之前**，它们就会在**发送途中**执行 →
+     * 关中断期间 TXE 中断进不来 → 发送卡死在中途。
+     * 调到最后面之后，"正在发送"与"慢操作"天然串行化：**绝不在发送途中做慢操作。**
+     *
+     * 同时这也是 response[] 的安全垫：s_tx_buf 指向 static response[]，
+     * 不等它发完就 process_request 下一帧，正在移出的尾部会变成脏数据。
+     * Modbus 一问一答，正常情况下早就发完了，这里只是兜底。 */
+    (void)modbus_tx_wait_done(MODBUS_RTU_TIMEOUT_MS);
+
     retentive_poll();
     motor_can_poll_rx();
     motor_can_tick();
-
-    /* 上一帧响应若还在中断驱动发送中，先等它发完（最多 20ms）。
-     * 必要性：s_tx_buf 指向 static response[]，若不等发完就处理下一帧，
-     * 新响应会覆写同一块缓冲，正在移出的字节就变成脏数据。
-     * Modbus 是一问一答，正常情况下早就发完了，这里只是兜底。
-     * 发送周期 5ms，一帧 8~40 字节约 0.7~3.5ms @115200，20ms 上限绰绰有余。 */
-    (void)modbus_tx_wait_done(MODBUS_RTU_TIMEOUT_MS);
 
     /* 姿态前馈自动占空比：每轮 poll(5ms) 更新一次。
      * 放在 ModbusTask 而非 InsTask 的原因：
@@ -1833,6 +1920,18 @@ void modbus_poll(void)
                         if (response_len > 0U)
                         {
                             modbus_send_frame(response, response_len);
+
+                            /* ⚠️ **发出去之后必须立刻【跳出】取帧循环，不能 `continue`**（2026-09-23 修）。
+                             * response[] 是 static，此刻它正被**中断**逐字节读出去；
+                             * 若继续循环又处理一帧，process_request 就会覆写同一块缓冲，
+                             * 正在移出的尾部直接变脏数据。
+                             * 原注释"一问一答、无需加锁"并不严密：只要主站在上一帧**还没发完**
+                             * 时又发了一帧 —— 连发、超时重发、多窗口轮询都会 —— 覆写就会真的发生。
+                             * 改为 break 后，由下一轮 poll 顶部的 modbus_tx_wait_done() 兜底等待；
+                             * 环形缓冲里剩余的字节留到那时再处理，**不会丢**。 */
+                            memset(frame, 0, sizeof(frame));
+                            frame_len = 0U;
+                            break;
                         }
                         memset(frame, 0, sizeof(frame));
                         frame_len = 0U;
