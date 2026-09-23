@@ -23,9 +23,10 @@
   *    这也是例程把 DMA2_Stream2_IRQHandler 直接写在 INS_task.c 里的原因。
   *
   * 本文件相对例程的差异：
-  *   1. 六轴：只用 MahonyAHRSupdateIMU，不接 IST8310（yaw 仅占位）。
-  *   2. MahonyAHRS 积分项由"清零"改为"限幅"，采样率运行时设置。
-  *   3. 快照改用 seqlock，姿态按 deg 输出。
+ *   1. 九轴：2026-09-23 接入板载 IST8310（I2C3，PA8/PC9，400kHz，100Hz 读取），
+ *      硬件在线且 0x014A 使能时用 MahonyAHRSupdate；离线/关闭时回退六轴。
+ *   2. MahonyAHRS 积分项由"清零"改为"限幅"，采样率运行时设置。
+ *   3. 快照改用 seqlock，姿态按 deg 输出。
   ******************************************************************************
   */
 
@@ -35,6 +36,8 @@
 #include "BMI088driver.h"
 #include "BMI088reg.h"
 #include "BMI088Middleware.h"
+#include "ist8310driver.h"
+#include "ist8310driver_middleware.h"
 #include "MahonyAHRS.h"
 #include "pid.h"
 #include "bsp_spi.h"
@@ -108,7 +111,23 @@ static volatile uint16_t s_heater_pwm = 0;
 /* 上一帧读数 */
 static float s_gyro[3]  = {0};
 static float s_accel[3] = {0};
+static float s_mag[3]   = {0};    /* IST8310 磁力计 μT（100Hz 刷新） */
 static float s_temp     = 0.0f;
+
+/* IST8310 状态：
+ *   s_mag_present  —— 硬件初始化是否成功（失败则全程回退六轴）
+ *   s_mag_enable   —— 融合使能开关（Modbus 0x014A 可在线切换，默认 1）
+ *   s_mag_init_err —— ist8310_init() 返回码，供诊断寄存器上报
+ * 真正参与融合 = present && enable。 */
+static uint8_t s_mag_present  = 0U;
+static uint8_t s_mag_enable   = 1U;
+static uint8_t s_mag_init_err = 0U;
+
+/* 磁力计 100Hz 分频计数（InsTask 主循环 1kHz，每 10 个周期读一次）。
+ * 磁力计带宽/数据率远低于陀螺，没必要 1kHz 读；且 I2C 阻塞读
+ * （400kHz 下 ~200μs）每 10ms 才发生一次，CPU 占用 <3%。 */
+#define MAG_READ_DIVIDER  10U
+static uint8_t s_mag_read_div = 0U;
 
 /* 温度首次达标标志：达标前满功率加热，达标后交给 PID。
  * 与例程的 first_temperate 同名同义。 */
@@ -189,6 +208,14 @@ static void publish_snapshot(void)
     tmp.quat_x = q[1];
     tmp.quat_y = q[2];
     tmp.quat_z = q[3];
+
+    /* IST8310 诊断量（100Hz 刷新的最近一次原始磁场 + 融合链路状态） */
+    tmp.mag_x = s_mag[0];
+    tmp.mag_y = s_mag[1];
+    tmp.mag_z = s_mag[2];
+    tmp.mag_present  = s_mag_present;
+    tmp.mag_active   = (uint8_t)(s_mag_present && s_mag_enable);
+    tmp.mag_init_err = s_mag_init_err;
 
     s_snap_seq++;                    /* -> 奇数，标志"正在写" */
     __DMB();
@@ -474,6 +501,19 @@ uint8_t ins_init(void)
         return err;
     }
 
+    /* IST8310 磁力计：可选，失败不阻塞（回退六轴模式）。
+     * 无论成败都记下返回码，供 Modbus 诊断寄存器上报。 */
+    s_mag_init_err = ist8310_init();
+    if (s_mag_init_err == IST8310_NO_ERROR)
+    {
+        s_mag_present = 1U;
+        ist8310_read_mag(s_mag);   /* 读一次初值 */
+    }
+    else
+    {
+        s_mag_present = 0U;
+    }
+
     /* 读一次原始数据（初始化自检，同时为 Mahony 提供初值参考） */
     BMI088_read(s_gyro, s_accel, &s_temp);
 
@@ -600,9 +640,32 @@ void InsTask_Entry(void *argument)
             imu_temp_control(s_temp);
         }
 
-        /* 六轴姿态解算：用加速度计修正 roll/pitch，yaw 由陀螺积分（会漂） */
-        MahonyAHRSupdateIMU(q, s_gyro[0], s_gyro[1], s_gyro[2],
-                               s_accel[0], s_accel[1], s_accel[2]);
+        /* 磁力计 100Hz 读取（每 10 个 1kHz 周期一次）。
+         * 只更新 s_mag 缓存；姿态融合仍每周期跑，磁分量用最近一次值。 */
+        if (s_mag_present)
+        {
+            if (++s_mag_read_div >= MAG_READ_DIVIDER)
+            {
+                s_mag_read_div = 0U;
+                ist8310_read_mag(s_mag);
+            }
+        }
+
+        /* 姿态解算：
+         *   硬件在线且使能 → MahonyAHRSupdate（九轴，gyro+accel+mag，yaw 不累积漂移）
+         *   否则           → MahonyAHRSupdateIMU（六轴，yaw 由陀螺积分会漂） */
+        if (s_mag_present && s_mag_enable)
+        {
+            MahonyAHRSupdate(q,
+                             s_gyro[0], s_gyro[1], s_gyro[2],
+                             s_accel[0], s_accel[1], s_accel[2],
+                             s_mag[0],  s_mag[1],  s_mag[2]);
+        }
+        else
+        {
+            MahonyAHRSupdateIMU(q, s_gyro[0], s_gyro[1], s_gyro[2],
+                                   s_accel[0], s_accel[1], s_accel[2]);
+        }
 
         publish_snapshot();
     }
@@ -653,4 +716,14 @@ float ins_get_target_temp(void)
 uint16_t ins_get_heater_pwm(void)
 {
     return s_heater_pwm;
+}
+
+void ins_set_mag_enable(uint8_t en)
+{
+    s_mag_enable = (en != 0U) ? 1U : 0U;
+}
+
+uint8_t ins_get_mag_enable(void)
+{
+    return s_mag_enable;
 }

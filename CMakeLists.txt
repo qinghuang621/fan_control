@@ -56,6 +56,9 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
    ${CMAKE_CURRENT_SOURCE_DIR}/components/controller/pid.c
    ${CMAKE_CURRENT_SOURCE_DIR}/components/devices/BMI088driver.c
    ${CMAKE_CURRENT_SOURCE_DIR}/components/devices/BMI088Middleware.c
+   ${CMAKE_CURRENT_SOURCE_DIR}/components/devices/ist8310driver.c
+   ${CMAKE_CURRENT_SOURCE_DIR}/components/devices/ist8310driver_middleware.c
+   ${CMAKE_CURRENT_SOURCE_DIR}/Src/i2c.c
 )
 
 # Add include paths

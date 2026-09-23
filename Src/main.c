@@ -27,6 +27,7 @@
 #include "usart.h"
 #include "gpio.h"
 #include "spi.h"
+#include "i2c.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -181,6 +182,7 @@ int main(void)
   MX_TIM1_Init();
   MX_SPI1_Init();
   MX_TIM10_Init();
+  MX_I2C3_Init();
   /* USB CDC 已废弃：CAN1 占用 PD0/PD1，且不再使用虚拟串口调试 */
   /* USER CODE BEGIN 2 */
 
