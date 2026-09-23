@@ -75,8 +75,15 @@ void Error_Handler(void);
 #define INT1_GYRO_GPIO_Port        GPIOC
 #define INT1_GYRO_EXTI_IRQn        EXTI9_5_IRQn
 
-/* IST8310 占位：本轮不接磁力计，但 PG 口引脚已在 C 板上被 TIM1 FG / PG8 RS485 占用，
- * 故此处不定义 RSTN/DRDY。下一轮接磁力计时再评估可用引脚。 */
+/* IST8310 磁力计（板载）：PG6 = RSTN（推挽输出，默认高电平=不复位），
+ *   PG3 = DRDY（输入上拉，本轮暂不接中断）。I2C3 走 PA8(AF4)/PC9(AF4)，
+ *   与 RS485 的 PG8/PG9/PG14 无引脚冲突（先前被误判为冲突，已核实）。 */
+
+#define RSTN_IST8310_Pin           GPIO_PIN_6
+#define RSTN_IST8310_GPIO_Port     GPIOG
+
+#define DRDY_IST8310_Pin           GPIO_PIN_3
+#define DRDY_IST8310_GPIO_Port     GPIOG
 
 /* USER CODE END Private defines */
 
