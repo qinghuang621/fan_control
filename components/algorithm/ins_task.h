@@ -44,6 +44,20 @@ typedef struct
     uint8_t mag_present;/* 硬件初始化结果：1=IST8310 在线，0=离线（回退六轴） */
     uint8_t mag_active; /* 当前是否真正参与融合：present && 使能开关 */
     uint8_t mag_init_err;/* ist8310_init() 返回码：0=成功，0x40=NO_SENSOR，1~4=配置校验失败 */
+
+    /* ---- 【临时诊断 2026-09-23】磁力计 I2C 读健康度，定位完整段删除 ----
+     * 背景：驱动原版读失败时静默解析栈上残留内存，输出"几千 μT"的假读数，
+     *       且 MAG_STATUS 仍报九轴在跑。这组量让"读不到"变成可观测的。
+     * 对应寄存器 0x0184~0x018B（只读、在断电保持区之外）。 */
+    int16_t  mag_raw_x;      /* 原始 16 位计数（不乘 0.3） */
+    int16_t  mag_raw_y;
+    int16_t  mag_raw_z;
+    uint16_t mag_ok_cnt;     /* I2C 读成功累计 */
+    uint16_t mag_err_cnt;    /* I2C 读失败累计 */
+    uint8_t  mag_hal;        /* 最后一次 HAL 返回码：0=OK 1=ERROR 2=BUSY 3=TIMEOUT */
+    uint8_t  mag_i2c_state;  /* 读后 hi2c3.State：0x20=READY 0x24=BUSY 0xA0=TIMEOUT 0xE0=ERROR */
+    uint8_t  mag_i2c_errcode;/* 读后 hi2c3.ErrorCode：0x01=BERR 0x02=ARLO 0x04=AF(NACK) 0x08=OVR 0x20=TIMEOUT */
+    uint16_t mag_recover_cnt;/* 【自愈】I2C3 复位次数 —— 直接反映"毛刺发生了多少次" */
 } ins_snapshot_t;
 
 /* ============================ 运行状态 ============================ */
@@ -132,7 +146,7 @@ uint16_t ins_get_heater_pwm(void);
 
 /**
  * @brief  磁力计融合使能开关（由 Modbus 0x014A 转发）
- *         en=1 且硬件在线时走九轴 MahonyAHRSupdate；en=0 强制六轴
+ *         en=1 且硬件在线【且读数健康】时走九轴 MahonyAHRSupdate；en=0 强制六轴
  */
 void ins_set_mag_enable(uint8_t en);
 

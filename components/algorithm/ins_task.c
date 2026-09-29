@@ -23,8 +23,10 @@
   *    这也是例程把 DMA2_Stream2_IRQHandler 直接写在 INS_task.c 里的原因。
   *
   * 本文件相对例程的差异：
- *   1. 九轴：2026-09-23 接入板载 IST8310（I2C3，PA8/PC9，400kHz，100Hz 读取），
- *      硬件在线且 0x014A 使能时用 MahonyAHRSupdate；离线/关闭时回退六轴。
+ *   1. 九轴：2026-09-23 接入板载 IST8310（I2C3，PA8/PC9，
+ *      **100kHz**（原 400kHz，09-23 因内部上拉不足降速），100Hz 读取）。
+ *      走九轴的条件 = **硬件在线 && 0x014A 使能 && 读数健康**（三者缺一即回退六轴），
+ *      见 mag_nine_axis_active()。读数健康这一项 09-29 才补上。
  *   2. MahonyAHRS 积分项由"清零"改为"限幅"，采样率运行时设置。
  *   3. 快照改用 seqlock，姿态按 deg 输出。
   ******************************************************************************
@@ -112,22 +114,51 @@ static volatile uint16_t s_heater_pwm = 0;
 static float s_gyro[3]  = {0};
 static float s_accel[3] = {0};
 static float s_mag[3]   = {0};    /* IST8310 磁力计 μT（100Hz 刷新） */
+static int16_t s_mag_raw[3] = {0};/* 【临时诊断】原始 16 位计数（不乘 0.3） */
 static float s_temp     = 0.0f;
 
 /* IST8310 状态：
  *   s_mag_present  —— 硬件初始化是否成功（失败则全程回退六轴）
  *   s_mag_enable   —— 融合使能开关（Modbus 0x014A 可在线切换，默认 1）
- *   s_mag_init_err —— ist8310_init() 返回码，供诊断寄存器上报
- * 真正参与融合 = present && enable。 */
-static uint8_t s_mag_present  = 0U;
-static uint8_t s_mag_enable   = 1U;
-static uint8_t s_mag_init_err = 0U;
+ *   s_mag_init_err    —— ist8310_init() 返回码，供诊断寄存器上报
+ *   s_mag_fail_streak —— 连续读失败次数（任一成功即清零）
+ * 真正参与融合 = present && enable && 读数健康（fail_streak < MAG_FAIL_LIMIT）。
+ *
+ * ⚠️ 2026-09-29：原判据只有 present && enable，**完全不看读数是否成功** ——
+ * I2C 卡死、s_mag 冻结在旧值、Mahony 一直喂同一个向量时，
+ * MAG_STATUS(0x014B) 仍报 1（"九轴在跑"），故障完全静默。
+ * 与 09-23 修掉的"驱动静默失败"是同一类问题的残留，这次补齐。 */
+static uint8_t s_mag_present     = 0U;
+static uint8_t s_mag_enable      = 1U;
+static uint8_t s_mag_init_err    = 0U;
+static uint8_t s_mag_fail_streak = 0U;
 
 /* 磁力计 100Hz 分频计数（InsTask 主循环 1kHz，每 10 个周期读一次）。
- * 磁力计带宽/数据率远低于陀螺，没必要 1kHz 读；且 I2C 阻塞读
- * （400kHz 下 ~200μs）每 10ms 才发生一次，CPU 占用 <3%。 */
+ * 磁力计带宽/数据率远低于陀螺，没必要 1kHz 读；且 I2C 读是阻塞的，
+ * 每 10ms 才发生一次。
+ * ⚠️ 2026-09-23 起 ClockSpeed 已由 400kHz 降到 100kHz（板子只有内部上拉
+ * 30~50kΩ，400kHz 上升沿卡临界 → 随机总线毛刺 → 外设卡 BUSY 且不自愈），
+ * 单次读约 700μs，占 10ms 周期的 ~7%。 */
 #define MAG_READ_DIVIDER  10U
 static uint8_t s_mag_read_div = 0U;
+
+/* 连续读失败达此值即判定磁力计当前不可用 → MAG_STATUS(0x014B) 报 0。
+ * 取 3 与中间层自愈阈值一致：单次孤立毛刺（下次就成功）不会误降级；
+ * 而"卡死"表现为每次都失败 ⇒ 100Hz 下约 30ms 即完成降级，
+ * 不会像以前那样长时间把同一个冻结向量喂给 Mahony。 */
+#define MAG_FAIL_LIMIT    3U
+
+/* 九轴是否【真正】在跑：硬件在线 + 使能 + 读数健康。
+ * 融合切换与 MAG_STATUS 必须共用这一个判据 —— 否则会出现
+ * "报六轴却在用磁"或"报九轴却喂着冻结值"这类状态与行为不符。
+ * 为什么读数不健康要回退六轴（而不是继续用最后的有效值）：
+ * 冻结的磁矢量会持续声称"磁北仍在原来的机体方向"，车体一转它就
+ * **主动把 yaw 拉回旧航向**，比六轴的缓慢漂移更糟（六轴至少还能响应真实转动）。 */
+static uint8_t mag_nine_axis_active(void)
+{
+    return (uint8_t)(s_mag_present && s_mag_enable &&
+                     (s_mag_fail_streak < MAG_FAIL_LIMIT));
+}
 
 /* 温度首次达标标志：达标前满功率加热，达标后交给 PID。
  * 与例程的 first_temperate 同名同义。 */
@@ -214,8 +245,23 @@ static void publish_snapshot(void)
     tmp.mag_y = s_mag[1];
     tmp.mag_z = s_mag[2];
     tmp.mag_present  = s_mag_present;
-    tmp.mag_active   = (uint8_t)(s_mag_present && s_mag_enable);
+    /* 三条件：硬件在线 且 使能 且 **读数健康**。
+     * 第三项是本轮（09-29）补的 —— 少了它，I2C 卡死导致读数冻结时
+     * 也会报"九轴在跑"，上位机看到的是假状态。 */
+    tmp.mag_active   = mag_nine_axis_active();
     tmp.mag_init_err = s_mag_init_err;
+
+    /* 【临时诊断 2026-09-23】I2C 读健康度（定位完删除）。
+     * 直接取中间层的计数与现场 —— 这样"读失败"就不再是静默的。 */
+    tmp.mag_raw_x      = s_mag_raw[0];
+    tmp.mag_raw_y      = s_mag_raw[1];
+    tmp.mag_raw_z      = s_mag_raw[2];
+    tmp.mag_ok_cnt     = g_mag_i2c_ok;
+    tmp.mag_err_cnt    = g_mag_i2c_err;
+    tmp.mag_hal        = g_mag_i2c_hal;
+    tmp.mag_i2c_state  = g_mag_i2c_state;
+    tmp.mag_i2c_errcode = g_mag_i2c_errcode;
+    tmp.mag_recover_cnt = g_mag_i2c_recover;
 
     s_snap_seq++;                    /* -> 奇数，标志"正在写" */
     __DMB();
@@ -507,7 +553,12 @@ uint8_t ins_init(void)
     if (s_mag_init_err == IST8310_NO_ERROR)
     {
         s_mag_present = 1U;
-        ist8310_read_mag(s_mag);   /* 读一次初值 */
+        /* 读一次初值；失败也计进 fail_streak —— 否则"初始化自检通过但随后读不到"
+         * 会仍被当成九轴可用。 */
+        if (ist8310_read_mag(s_mag, s_mag_raw) == 0U)
+        {
+            s_mag_fail_streak = 1U;
+        }
     }
     else
     {
@@ -647,14 +698,24 @@ void InsTask_Entry(void *argument)
             if (++s_mag_read_div >= MAG_READ_DIVIDER)
             {
                 s_mag_read_div = 0U;
-                ist8310_read_mag(s_mag);
+                /* 成功清零、失败累加（饱和到 255，防 8 位回绕）——
+                 * 供下面 mag_active 判据与 0x014B 使用。 */
+                if (ist8310_read_mag(s_mag, s_mag_raw) != 0U)
+                {
+                    s_mag_fail_streak = 0U;
+                }
+                else if (s_mag_fail_streak < 255U)
+                {
+                    s_mag_fail_streak++;
+                }
             }
         }
 
         /* 姿态解算：
-         *   硬件在线且使能 → MahonyAHRSupdate（九轴，gyro+accel+mag，yaw 不累积漂移）
-         *   否则           → MahonyAHRSupdateIMU（六轴，yaw 由陀螺积分会漂） */
-        if (s_mag_present && s_mag_enable)
+         *   硬件在线 且 使能 且 读数健康 → MahonyAHRSupdate（九轴，yaw 不累积漂移）
+         *   否则（离线 / 被关 / 连续读失败）→ MahonyAHRSupdateIMU（六轴，yaw 会漂）
+         * 判据与 MAG_STATUS 共用 mag_nine_axis_active()，保证状态与行为一致。 */
+        if (mag_nine_axis_active())
         {
             MahonyAHRSupdate(q,
                              s_gyro[0], s_gyro[1], s_gyro[2],

@@ -34,12 +34,17 @@ void MX_I2C3_Init(void)
 
   /* USER CODE END I2C3_Init 1 */
   hi2c3.Instance = I2C3;
-  /* IST8310 支持最高 400kHz Fast Mode（数据手册上限）。
-   * APB1=42MHz，DutyCycle_2：CCR=42MHz/(2×400kHz)≈53，满足 ≥400k 时序。
-   * 用 400k 而非 100k 的原因：InsTask 在 1kHz 周期里阻塞读 6 字节，
-   * 100k 下单次传输 ~700μs（占 70% 周期）会挤压 Modbus 时序；
-   * 400k 降到 ~200μs，且磁力计仅 100Hz 读取，实测占用 <3% CPU。 */
-  hi2c3.Init.ClockSpeed = 400000;
+  /* 🔴 2026-09-23：由 400000 降到 100000（修 I2C3 随机卡死）。
+   * 现象：400kHz 下 I2C3 会【随机毛刺后永久卡死在 BUSY】—— 实测两次，
+   *       分别在连续成功约 134s / 45s 后卡死；此后 MAG_OK 冻结、MAG_ERR 持续涨、
+   *       HAL 恒返回 HAL_BUSY（State 仍是 READY，即外设看到总线 BUSY 卡住）。
+   * 原因：本板 PA8/PC9 只启用了【内部上拉】(约 30~50kΩ)，而 400kHz 需要 2~5kΩ，
+   *       上升沿时间处于临界 ⇒ 随机毛刺的温床。100kHz 对上升沿要求宽松 10 倍。
+   * 代价：InsTask 每 10ms 阻塞读一次，单次传输由 ~200μs 增至 ~700μs（占 7% CPU），
+   *       仍可接受；再叠加 `ist8310_read_mag()` 读前的触发写，合计约 1.1ms/10ms。
+   * ⚠️ 根上的修法是给 PA8/PC9 补 4.7kΩ 外部上拉到 3.3V，之后再评估能否回升 400k。
+   * ⚠️ 另有软件兜底：连续失败 3 次即复位 I2C3（见 ist8310driver_middleware.c）。 */
+  hi2c3.Init.ClockSpeed = 100000;
   hi2c3.Init.DutyCycle = I2C_DUTYCYCLE_2;
   hi2c3.Init.OwnAddress1 = 0;
   hi2c3.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;

@@ -89,18 +89,42 @@ void ist8310_read_over(uint8_t *status_buf, ist8310_real_data_t *ist8310_real_da
 
 /* 直接从 IST8310 读原始磁力计数据（本工程使用路径）
  *   寄存器 0x03 = X_L, 0x04 = X_H, ..., 0x08 = Z_H，共 6 字节
- *   16 位有符号 → 乘 0.3 → μT */
-void ist8310_read_mag(fp32 mag[3])
+ *   16 位有符号 → 乘 0.3 → μT
+ *
+ * 【临时诊断 2026-09-23】原版有静默失败隐患，本次修正两处：
+ *   ① `uint8_t buf[6];` 未初始化 —— 而读失败时 buf 不会被写入，调用方却照常解析，
+ *      于是输出的是**栈上残留内存**，表现成"几千 μT 的巨大磁场"且随栈内容跳变。
+ *      已实测确认（还原出的字节前 4 位正是 float 0.3f = MAG_SEN 的位模式）。
+ *   ② 读失败时**不更新 mag[]**，保留上一次有效值，并返回 0 供调用方计数。
+ *
+ * 返回 1=成功 / 0=失败。raw 非空时输出原始 16 位计数（不乘 0.3），便于诊断。 */
+uint8_t ist8310_read_mag(fp32 mag[3], int16_t raw[3])
 {
-    uint8_t buf[6];
-    int16_t temp;
+    uint8_t buf[6] = {0, 0, 0, 0, 0, 0};
 
-    ist8310_IIC_read_muli_reg(0x03, buf, 6);
+    /* 【兜底触发器 2026-09-23】读之前重写一次 CNTL1(0x0A)。
+     * 依据：DJI 原例程注释 `{0x0A, 0x0B, 0x04} //200Hz output rate` 说明这是
+     * 【连续输出】模式，理论上不需要每次触发；但另一份分析怀疑这里是
+     * Single Measurement 模式（那样数据寄存器就会冻结在首测值上）。
+     * 两种模式下重写同值都【无副作用】，而若是单次模式则能真正解决问题 ——
+     * 因此加上，把"数据是否被冻结"这个悬念彻底排除。
+     * 代价：100kHz 下这次写约 400μs，与随后的读合计约 1.1ms / 10ms。 */
+    ist8310_IIC_write_single_reg(0x0A, 0x0B);
+    ist8310_delay_us(150U);
 
-    temp = (int16_t)((buf[1] << 8) | buf[0]);
-    mag[0] = MAG_SEN * temp;
-    temp = (int16_t)((buf[3] << 8) | buf[2]);
-    mag[1] = MAG_SEN * temp;
-    temp = (int16_t)((buf[5] << 8) | buf[4]);
-    mag[2] = MAG_SEN * temp;
+    /* 读失败就原样返回：绝不用未初始化的 buf 去"解析"出假数据 */
+    if (ist8310_IIC_read_muli_reg(0x03, buf, 6) == 0U)
+    {
+        return 0U;
+    }
+
+    raw[0] = (int16_t)((buf[1] << 8) | buf[0]);
+    raw[1] = (int16_t)((buf[3] << 8) | buf[2]);
+    raw[2] = (int16_t)((buf[5] << 8) | buf[4]);
+
+    mag[0] = MAG_SEN * raw[0];
+    mag[1] = MAG_SEN * raw[1];
+    mag[2] = MAG_SEN * raw[2];
+
+    return 1U;
 }
