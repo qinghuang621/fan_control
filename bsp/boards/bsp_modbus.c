@@ -317,6 +317,36 @@ static uint32_t modbus_t35_gap_ms(uint32_t baud)
 #define REG_MAG_ECODE      0x018BU  /* hi2c3.ErrorCode：0x04=AF(NACK) 0x01=BERR 0x02=ARLO 0x20=TIMEOUT */
 #define REG_MAG_RECOVER    0x018CU  /* 【自愈】I2C3 复位次数 —— 直接反映"毛刺发生了多少次" */
 #define REG_MAG_DIAG_END   0x018CU
+
+/* ==================== 运动控制的姿态输出区 0x0190~0x01A7（只读） ====================
+ * 2026-09-30 新增。上位机（ROS2）做姿态融合运动控制要四组量，其中两组此前没有：
+ *   角速度     → 0x0156~0x015B（已有）· 四元数 → 0x0174~0x017B（已有）
+ *   线加速度   → 本区（新增）
+ *   姿态协方差 → 本区（新增）
+ * 与姿态区同源：同一次 ins_get_snapshot()、同一个 5ms 节拍 ⇒ 不会与其他量错配
+ * （对比反例：0x014D/0x014E 那两个 float32 是上位机分两次写的，存在"半新半旧"窗口）。 */
+#define REG_IMU_ACCEL_X    0x0190U  /* float32 m/s²，机体系【比力】，**含重力**：
+                                     * 静止水平时 ACCEL_Z ≈ +9.8。固件不做"减重力"—— */
+#define REG_IMU_ACCEL_Y    0x0192U  /* 减重力必须依赖姿态，会把姿态误差耦合进加速度；且 */
+#define REG_IMU_ACCEL_Z    0x0194U  /* ROS2 的 sensor_msgs/Imu.linear_acceleration 本身就是比力。 */
+#define REG_IMU_ORICOV     0x0196U  /* float32×9 姿态协方差，3×3 **行主序**，单位 rad²，
+                                     * 顺序 (roll, pitch, yaw)：对角=方差，其余 6 个恒 0。
+                                     * 取值来源见 s_cov_sigma_* 与协方差发布处的说明。 */
+#define REG_IMU_ORICOV_END 0x01A7U
+
+/* ---- 协方差的 σ：可写 + 断电保持，单位【度】 ----
+ * 落在保持区空地 0x00C0~0x00C5（原先恒 0、全仓无代码引用）。
+ * 放这里的好处：天然落盘、无需扩区、无需升 FLASH_RETENTIVE_VERSION。
+ * 现场改这 3 个数就能改协方差输出，**不必重烧固件** —— 与上位机 EKF 联调时必然反复调。
+ * ⚠️ 写它会触发一次落盘（2s 去抖 + 1~2s 擦除），期间通信中断属正常。 */
+#define REG_COV_SIGMA_ROLL  0x00C0U  /* float32 deg，默认 1.0 */
+#define REG_COV_SIGMA_PITCH 0x00C2U  /* float32 deg，默认 1.0 */
+#define REG_COV_SIGMA_YAW   0x00C4U  /* float32 deg，默认 10.0（yaw 未标定前差得多） */
+#define REG_COV_SIGMA_END   0x00C5U
+
+#define COV_SIGMA_ROLL_DEF   1.0f
+#define COV_SIGMA_PITCH_DEF  1.0f
+#define COV_SIGMA_YAW_DEF   10.0f
 #define LUT_STEP_DEG       15.0f
 #define LUT_DEG2RAD        0.017453292519943295f
 #define LUT_RAD2DEG        57.29577951308232f
@@ -406,6 +436,10 @@ _Static_assert((REG_PARAM_BASE + FLASH_RETENTIVE_PARAM_COUNT - 1U) == REG_RETENT
                "retentive region end != REG_RETENTIVE_END");
 
 static void motor_can_poll_rx(void);
+
+/* 前置声明：refresh_imu_registers()（文件中部）要用它读协方差 σ，
+ * 而它的定义在文件后半的 float32 辅助函数区 —— 不前置会变成隐式声明（C 里按 int 返回）。 */
+static float read_float32_regs(const uint16_t *regs, uint16_t addr);
 
 static uint16_t crc16_update(uint16_t crc, uint8_t byte)
 {
@@ -670,18 +704,20 @@ static uint8_t is_auto_param_region(uint16_t addr)
 
 /* IMU 姿态输出区为只读：上位机写这些地址一律静默忽略（不返回异常码，
  * 保持与既有状态区 0x0040~0x008F 相同的"写无效但不报错"行为，便于上位机统一处理）。
- * 覆盖五段：① `0x0150~0x015F` 姿态/角速度/温度；
+ * 覆盖六段：① `0x0150~0x015F` 姿态/角速度/温度；
  *          ② `0x016E~0x016F` TILT_THETA（float32 实时 θ）；
  *          ③ `0x0174~0x017B` 姿态四元数；
  *          ④ `0x017C~0x0183` IST8310 磁力计（初始错误码 + 原始三轴）；
- *          ⑤ `0x0184~0x018C` 【临时诊断】磁力计 I2C 读健康度（定位完删除）。
+ *          ⑤ `0x0184~0x018C` 【临时诊断】磁力计 I2C 读健康度（定位完删除）；
+ *          ⑥ `0x0190~0x01A7` 线加速度 + 姿态协方差（运动控制用，2026-09-30 新增）。
  * 这些都是每 5ms 被 refresh_imu_registers() 覆盖的实时量，允许写只会静默失效、徒增困惑。 */
 static uint8_t is_imu_status_region(uint16_t addr)
 {
     return ((addr >= REG_IMU_BASE) && (addr <= REG_IMU_END)) ||
            ((addr >= REG_IMU_THETA) && (addr <= (uint16_t)(REG_IMU_THETA + 1U))) ||
            ((addr >= REG_IMU_QUAT_W) && (addr <= REG_IMU_QUAT_END)) ||
-           ((addr >= REG_MAG_INIT_ERR) && (addr <= REG_MAG_DIAG_END));
+           ((addr >= REG_MAG_INIT_ERR) && (addr <= REG_MAG_DIAG_END)) ||
+           ((addr >= REG_IMU_ACCEL_X) && (addr <= REG_IMU_ORICOV_END));
 }
 
 static uint8_t get_modbus_slave_addr(void)
@@ -973,6 +1009,44 @@ static void refresh_imu_registers(void)
     write_float32_le(s_holding_regs, REG_IMU_QUAT_X, snap.quat_x);
     write_float32_le(s_holding_regs, REG_IMU_QUAT_Y, snap.quat_y);
     write_float32_le(s_holding_regs, REG_IMU_QUAT_Z, snap.quat_z);
+
+    /* ---- 运动控制区 0x0190~0x01A7（2026-09-30 新增）----
+     * ① 线加速度：机体系**比力**，原样上抛、**不减去重力**（理由见 REG_IMU_ACCEL_X 定义处）。
+     * ② 姿态协方差：本工程**没有协方差递推**（Mahony 是 PI 型互补滤波，不是卡尔曼），
+     *    因此给的是**按误差源估的量级**，只填对角、互相关恒 0：
+     *      roll / pitch ← 加速度计噪声 + 倾斜估计误差；
+     *      yaw         ← 磁航向误差（硬铁/软铁 + 磁轴未对齐），默认比 roll/pitch 大一个量级
+     *                    —— 本机水平分量只有 ~25 μT，5 μT 偏置即 ~12° 误差。
+     *    σ 现场可改（0x00C0~0x00C5，单位【度】，断电保持），改完立刻生效、无需重烧固件。
+     *    ⚠️ 这是"能用的起点"，**不是标定结果**；做完磁标定后应据实测收窄（见 `计划2.md` §2.4）。 */
+    write_float32_le(s_holding_regs, REG_IMU_ACCEL_X, snap.accel_x);
+    write_float32_le(s_holding_regs, REG_IMU_ACCEL_Y, snap.accel_y);
+    write_float32_le(s_holding_regs, REG_IMU_ACCEL_Z, snap.accel_z);
+    {
+        float s_r = read_float32_regs(s_holding_regs, REG_COV_SIGMA_ROLL);
+        float s_p = read_float32_regs(s_holding_regs, REG_COV_SIGMA_PITCH);
+        float s_y = read_float32_regs(s_holding_regs, REG_COV_SIGMA_YAW);
+        float v_r = (s_r * LUT_DEG2RAD) * (s_r * LUT_DEG2RAD);
+        float v_p = (s_p * LUT_DEG2RAD) * (s_p * LUT_DEG2RAD);
+        float v_y = (s_y * LUT_DEG2RAD) * (s_y * LUT_DEG2RAD);
+
+        /* 非有限/越界兜底：σ 若被写成 NaN 或 Inf，输出 0 而不是把垃圾传给上位机。
+         * `!(v == v)` 捕 NaN；上界捕 ±Inf 与荒谬的大数。 */
+        if (!(v_r == v_r) || (v_r < 0.0f) || (v_r > 1.0e6f)) { v_r = 0.0f; }
+        if (!(v_p == v_p) || (v_p < 0.0f) || (v_p > 1.0e6f)) { v_p = 0.0f; }
+        if (!(v_y == v_y) || (v_y < 0.0f) || (v_y > 1.0e6f)) { v_y = 0.0f; }
+
+        /* 行主序：[0]Rxx [1]Rxy [2]Rxz [3]Ryx [4]Ryy [5]Ryz [6]Rzx [7]Rzy [8]Rzz */
+        write_float32_le(s_holding_regs, (uint16_t)(REG_IMU_ORICOV +  0U), v_r);
+        write_float32_le(s_holding_regs, (uint16_t)(REG_IMU_ORICOV +  2U), 0.0f);
+        write_float32_le(s_holding_regs, (uint16_t)(REG_IMU_ORICOV +  4U), 0.0f);
+        write_float32_le(s_holding_regs, (uint16_t)(REG_IMU_ORICOV +  6U), 0.0f);
+        write_float32_le(s_holding_regs, (uint16_t)(REG_IMU_ORICOV +  8U), v_p);
+        write_float32_le(s_holding_regs, (uint16_t)(REG_IMU_ORICOV + 10U), 0.0f);
+        write_float32_le(s_holding_regs, (uint16_t)(REG_IMU_ORICOV + 12U), 0.0f);
+        write_float32_le(s_holding_regs, (uint16_t)(REG_IMU_ORICOV + 14U), 0.0f);
+        write_float32_le(s_holding_regs, (uint16_t)(REG_IMU_ORICOV + 16U), v_y);
+    }
 
     /* IST8310 磁力计诊断（2026-09-23）：
      *   0x014B 融合状态（0=六轴，1=九轴），0x017C 初始化错误码，
@@ -1811,6 +1885,17 @@ void modbus_init(void)
         s_holding_regs[REG_LUT_BASE + i] = s_duty_lut_default[i];
     }
     s_holding_regs[REG_LUT_MAGIC] = REG_LUT_MAGIC_VAL;
+
+    /* ---- 协方差 σ 默认值（0x00C0~0x00C5，保持区空地，单位【度】）----
+     * roll/pitch 由加速度计噪声 + 倾斜估计定；yaw 由磁航向定 —— 未做硬铁/软铁标定前差得多，
+     * 故给 10°（本机水平分量仅 ~25 μT，5 μT 偏置即 ~12°），与 roll/pitch 差一个量级。
+     * ⚠️ 与其它保持区参数一样，下面的 retentive_load_params() 会用 flash 镜像**覆盖**本处默认值
+     *    （镜像有效时）⇒ 改这里只影响"首次上电 / 镜像被拒"的场景。
+     * 🔴 想让这三项"出厂即非零"，必须**同时升 FLASH_RETENTIVE_VERSION**，否则等于白烧 ——
+     *    上电会被旧镜像整块盖回 0（0 方差 = "该姿态角不可信"，会让上位机直接丢弃姿态）。 */
+    write_float32_le(s_holding_regs, REG_COV_SIGMA_ROLL,  COV_SIGMA_ROLL_DEF);
+    write_float32_le(s_holding_regs, REG_COV_SIGMA_PITCH, COV_SIGMA_PITCH_DEF);
+    write_float32_le(s_holding_regs, REG_COV_SIGMA_YAW,   COV_SIGMA_YAW_DEF);
 
     MX_CAN1_Init();
     retentive_load_params();

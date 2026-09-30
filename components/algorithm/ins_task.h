@@ -78,7 +78,13 @@ typedef enum
                                              * 在"温度 2 s 就到 45℃"的前提下白白拖长预热，
                                              * 而这段时间自动模式不接管（见 fan_auto_update()
                                              * 的 ins_get_status() 门），是有风险的窗口。 */
-#define INS_SAMPLE_PERIOD_MS      1U        /* 姿态解算周期(ms) -> 1kHz */
+#define INS_SAMPLE_PERIOD_MS      1U        /* 【标称】姿态解算周期(ms) -> 1kHz。
+                                             * ⚠️ 2026-09-30 起**不再用于 Mahony 的 sampleFreq**。
+                                             * 实际融合频率不是常量（唤醒源含每次 DMA 完成的软触发，
+                                             * 实测 ≈1624 Hz 且随负载漂），因此时间基改由**方案 A1**
+                                             * 每次融合用 DWT 实测真实 dt 提供，与本宏无关。
+                                             * 本宏仅作文档/标称值保留，见 ins_task.c 的
+                                             * INS_FUSION_FREQ_HZ / s_last_fuse_cyc 说明。 */
 
 /* 温控"提前切闭环 PID"的入口带宽(℃)：温度一旦升到 `目标 − 本值` 就交 PID。
  * 为什么需要它（2026-09-16 实测）：

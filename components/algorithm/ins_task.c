@@ -133,12 +133,17 @@ static uint8_t s_mag_enable      = 1U;
 static uint8_t s_mag_init_err    = 0U;
 static uint8_t s_mag_fail_streak = 0U;
 
-/* 磁力计 100Hz 分频计数（InsTask 主循环 1kHz，每 10 个周期读一次）。
- * 磁力计带宽/数据率远低于陀螺，没必要 1kHz 读；且 I2C 读是阻塞的，
- * 每 10ms 才发生一次。
- * ⚠️ 2026-09-23 起 ClockSpeed 已由 400kHz 降到 100kHz（板子只有内部上拉
- * 30~50kΩ，400kHz 上升沿卡临界 → 随机总线毛刺 → 外设卡 BUSY 且不自愈），
- * 单次读约 700μs，占 10ms 周期的 ~7%。 */
+/* 磁力计读分频计数：**每 MAG_READ_DIVIDER 次唤醒读一次磁**。
+ * ⚠️⚠️ 注意分母**不是 1 kHz**：InsTask 由 DRDY 中断驱动（唤醒源含每次 DMA 完成的软触发），
+ *   实际唤醒 ≈1624 Hz（见下方 INS_FUSION_FREQ_HZ 说明）。
+ *   ⇒ 磁读率 = 1624/10 ≈ **162 Hz（周期 ≈6.2 ms），不是设计的 100 Hz**。
+ * 每次磁读的耗时（100 kHz + 读前重触发 CNTL1）：
+ *   写 360μs + 延时 150μs + 读 6 字节 1140μs ≈ **1.5 ms**，
+ *   ⇒ 阻塞占比 ≈ 162 × 1.5ms ≈ **24%**（按"100Hz、10ms 周期"算是 15%，低估了 62%）。
+ * ⚠️ 2026-09-23 起 ClockSpeed 由 400kHz 降到 100kHz（板子只有内部上拉 30~50kΩ，
+ *   400kHz 上升沿卡临界 → 随机总线毛刺 → 外设卡 BUSY 且不自愈）。
+ *   ⇒ 降速前单次约 0.25ms，阻塞占比仅 ~4%。
+ * 📌 想同时降低阻塞与省算力：把读磁与融合都 gate 在「陀螺新数据」上（方案 A2，见 memory）。 */
 #define MAG_READ_DIVIDER  10U
 static uint8_t s_mag_read_div = 0U;
 
@@ -147,6 +152,41 @@ static uint8_t s_mag_read_div = 0U;
  * 而"卡死"表现为每次都失败 ⇒ 100Hz 下约 30ms 即完成降级，
  * 不会像以前那样长时间把同一个冻结向量喂给 Mahony。 */
 #define MAG_FAIL_LIMIT    3U
+
+/* ==================== MahonyAHRS 的时间基 ====================
+ * ✅ 2026-09-30 起改为【真实 dt】(方案 A1)，本宏降级为"首帧标称初值"。
+ *
+ * 背景（为什么原来必须有一个魔法数）：
+ *   InsTask 的唤醒源**不止陀螺 DRDY** —— imu_cmd_spi_dma() 每完成一次 DMA 就
+ *   __HAL_GPIO_EXTI_GENERATE_SWIT(PIN_0) 软触发一次 EXTI0；陀螺 1000 Hz + 加计 800 Hz
+ *   + 温度通道 ⇒ 通知约 1800~2600/s。而 Mahony **在循环体末尾无条件跑**
+ *   ⇒ 融合频率远超陀螺 ODR（host 实测 ≈1624 Hz）。而 MahonyAHRS.c 的积分写死
+ *   `0.5f * (1.0f / s_sampleFreq)`，原按 1 ms 积分 ⇒ 姿态积分过量约 1.62 倍
+ *   （移动时角度偏快、陀螺零偏随之放大）。
+ *   → 曾用"方案 C"把 sampleFreq 改成实测均值 1624 来摊平，但那是**固定值**，
+ *     而融合频率随负载漂（Modbus 轮询、姿态窗口开关、磁读阻塞 1.5 ms）⇒ 只能对平均。
+ *
+ * A1 为什么是根治：每次融合前用 DWT_CYCCNT 测出【距上次融合的真实间隔 dt】，
+ *   直接 `setSampleFreq(1/dt)`。因为该频率同时参与陀螺积分与 Kp 修正，
+ *   单位时间的总修正量 = 步数 · Kp·e·0.5·dt = 0.5·Kp·e ⇒ **与 dt 完全无关**,
+ *   所以频率漂到哪都不再影响积分总量与收敛速度。
+ *   ⇒ 不需要自适应（原 C+），也不需要把频率变成常量（原 A2）。
+ *
+ * 本宏现在只剩一个用途：**第一次融合**（s_last_fuse_cyc 仍为 0 时）的标称值,
+ *   第二帧起即被真实 dt 接管。
+ * ⚠️ 仍待办：那 ~38% 的重复 Mahony 计算没省掉（要靠 A2，属算力优化，不影响精度）。 */
+#define INS_FUSION_FREQ_HZ   1624.0f
+
+/* A1：dt 上界。任务被长时间抢占时若不加限，会一次性补一个很大的积分步 ⇒ 姿态跳变。
+ * 取 20 ms（= 50 Hz 下限，远低于任何正常融合间隔）。 */
+#define INS_DT_MAX_S         0.02f
+
+/* 上次融合时刻的 DWT 周期计数；0 = 尚未融合过（首帧走 INS_FUSION_FREQ_HZ）。
+ * ⚠️ **不要**在这里预置成 DWT->CYCCNT —— ins_init() 到首次融合之间隔着整个预热循环
+ * （24V 下约 3.5 s），那样首帧 dt 会是 3.5 s。保持 0、用标称值最干净。
+ * ⚠️ DWT_CYCCNT 是 32 位 @168MHz，每 25.6 s 溢出一次；`now - last` 用无符号减法
+ * 对单次溢出天然正确，而融合间隔是亚毫秒级 ⇒ 安全。 */
+static uint32_t s_last_fuse_cyc = 0U;
 
 /* 九轴是否【真正】在跑：硬件在线 + 使能 + 读数健康。
  * 融合切换与 MAG_STATUS 必须共用这一个判据 —— 否则会出现
@@ -568,8 +608,9 @@ uint8_t ins_init(void)
     /* 读一次原始数据（初始化自检，同时为 Mahony 提供初值参考） */
     BMI088_read(s_gyro, s_accel, &s_temp);
 
-    /* MahonyAHRS：按实际采样率设置 */
-    MahonyAHRS_setSampleFreq(1000.0f / (float)INS_SAMPLE_PERIOD_MS);
+    /* MahonyAHRS 时间基：这里只给"首帧标称初值"，第二帧起由 A1 用真实 dt 接管
+     * （完整说明见 INS_FUSION_FREQ_HZ / s_last_fuse_cyc 的定义处）。 */
+    MahonyAHRS_setSampleFreq(INS_FUSION_FREQ_HZ);
     MahonyAHRS_reset();
     q[0] = 1.0f; q[1] = q[2] = q[3] = 0.0f;
 
@@ -709,6 +750,33 @@ void InsTask_Entry(void *argument)
                     s_mag_fail_streak++;
                 }
             }
+        }
+
+        /* ---- A1：按【真实间隔】设置积分时间基（理由见 s_last_fuse_cyc 的定义处）----
+         * 必须在融合之前设置：s_sampleFreq 同时决定陀螺积分步长和 Kp 修正步长。 */
+        {
+            uint32_t now_cyc = DWT->CYCCNT;
+            uint32_t el_cyc  = now_cyc - s_last_fuse_cyc;
+            float dt;
+
+            /* 两种情况都退回标称值，**不能**用 el_cyc 算 dt：
+             *   ① 首帧：s_last_fuse_cyc 还是 0，el_cyc = 开机至今（可达数秒）；
+             *   ② 🔴 DWT 未计数（CYCCNT 停住）：el_cyc 恒 0 ⇒ dt 会算成 0
+             *      ⇒ `1.0f/dt` = inf ⇒ setSampleFreq(inf)（它只挡 freq>1，挡不住 inf）
+             *      ⇒ 积分步长变 0 ⇒ **姿态永久冻结且完全静默**。这条兜底是必需的。 */
+            if ((s_last_fuse_cyc == 0U) || (el_cyc == 0U))
+            {
+                dt = 1.0f / INS_FUSION_FREQ_HZ;
+            }
+            else
+            {
+                dt = (float)el_cyc / (float)SystemCoreClock;
+                if (dt > INS_DT_MAX_S) { dt = INS_DT_MAX_S; }   /* 上界钳位 */
+            }
+            s_last_fuse_cyc = now_cyc;
+
+            /* setSampleFreq 自带 `freq > 1.0f` 的下界保护（dt ≥ 1s 时不更新）。 */
+            MahonyAHRS_setSampleFreq(1.0f / dt);
         }
 
         /* 姿态解算：

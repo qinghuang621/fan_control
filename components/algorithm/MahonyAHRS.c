@@ -10,10 +10,13 @@
 // 02/10/2011	SOH Madgwick	Optimised for reduced CPU load
 //
 // 【本项目相对例程的三处改动】
-//   1. 积分限幅：例程里 twoKi 默认为 0，走到 else 分支直接把积分项清零，
-//      所谓 "prevent integral windup" 其实是"关积分"。现在改为 twoKi > 0 且
-//      对积分项做幅度 clamp（INTEGRAL_LIMIT），既保留积分消除稳态偏差的能力，
-//      又不会在长时间大误差下积分饱和导致姿态猛冲。
+//   1. 积分限幅（代码就位，但【默认未启用】）：例程里 twoKi 默认为 0，走到 else
+//      分支直接把积分项清零，所谓 "prevent integral windup" 其实是"关积分"。
+//      本项目补了幅度 clamp（INTEGRAL_LIMIT），但 ⚠️ twoKiDef 仍是 `2.0f * 0.0f`
+//      = 0 ⇒ `if(twoKi > 0.0f)` 恒不成立，积分分支【实际从未执行】；
+//      INTEGRAL_LIMIT 与两处 clamp 属"就位待用"（当前是死代码）。
+//      要启用：改 twoKiDef，或运行时写 twoKi（2026-09-29 查证：全仓无运行期赋值）。
+//      ⚠️ 启用后须与 Kp 重新调平衡，否则积分项会与加计/磁参考"打架"。
 //   2. sampleFreq 可配置：例程写死 1000.0f，若实际调用周期不是 1kHz，
 //      比例/积分反馈的时间尺度就错了，姿态会收敛过慢或抖动。
 //   3. 四元数由调用方传入（q[4]），不依赖全局 q0~q3，便于多实例与快照。
@@ -151,6 +154,7 @@ void MahonyAHRSupdate(float q[4], float gx, float gy, float gz, float ax, float 
 		halfez = (ax * halfvy - ay * halfvx) + (mx * halfwy - my * halfwx);
 
 		// Compute and apply integral feedback if enabled
+		// ⚠️ twoKi 当前 = 0（twoKiDef = 2.0f * 0.0f）⇒ 本分支不生效，走 else 分支。
 		if(twoKi > 0.0f) {
 			integralFBx += twoKi * halfex * (1.0f / s_sampleFreq);	// integral error scaled by Ki
 			integralFBy += twoKi * halfey * (1.0f / s_sampleFreq);
@@ -224,6 +228,7 @@ void MahonyAHRSupdateIMU(float q[4], float gx, float gy, float gz, float ax, flo
 		halfez = (ax * halfvy - ay * halfvx);
 
 		// Compute and apply integral feedback if enabled
+		// ⚠️ twoKi 当前 = 0（twoKiDef = 2.0f * 0.0f）⇒ 本分支不生效，走 else 分支。
 		if(twoKi > 0.0f) {
 			integralFBx += twoKi * halfex * (1.0f / s_sampleFreq);	// integral error scaled by Ki
 			integralFBy += twoKi * halfey * (1.0f / s_sampleFreq);
