@@ -18,7 +18,13 @@ typedef struct
     float gyro_x;    /* rad/s, 机体坐标系 */
     float gyro_y;
     float gyro_z;
-    float accel_x;   /* g */
+    /* 机体系【比力】，单位 **m/s²**（不是 g！）——硬件驱动按 BMI088_ACCEL_3G_SEN
+     * = 0.0008974 m/s²/LSB 换算，**含重力、固件不减** ⇒ 静止水平时 accel_z ≈ +9.8。
+     * 与 ROS2 sensor_msgs/Imu.linear_acceleration 的口径一致。
+     * ⚠️ 2026-10-08 更正：此三行原注释误标为「单位 g」，与 bsp_modbus.c 及
+     *    接口文档 §6.10 的 m/s² 冲突。实测 ACCEL_Z ≈ 9.46、|a| = 9.80 证实为
+     *    m/s²（若真是 g，静止时该读到 1.0 而不是 9.8），原注释有误，已更正。 */
+    float accel_x;
     float accel_y;
     float accel_z;
     float temperature;  /* ℃, BMI088 板载传感器 */
