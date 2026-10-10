@@ -612,7 +612,31 @@ uint8_t ins_init(void)
      * （完整说明见 INS_FUSION_FREQ_HZ / s_last_fuse_cyc 的定义处）。 */
     MahonyAHRS_setSampleFreq(INS_FUSION_FREQ_HZ);
     MahonyAHRS_reset();
-    q[0] = 1.0f; q[1] = q[2] = q[3] = 0.0f;
+
+    /* 姿态初值：用上面刚读到的加计把 roll/pitch 直接置对（2026-10-10 新增）。
+     * 旧写法把 q 硬置成 (1,0,0,0) = 姿态 (0,0,0) deg，之后靠 P 项爬约 1/Kp = 2~3 s 才到真值；
+     * 那段窗口里 θ 是错的 —— 上位机若此时接管风机前馈会按"水平档"算。
+     * 静止时 a_hat = R^T*z_hat = (-sinθ, sinφ*cosθ, cosφ*cosθ)
+     *   => pitch = asin(-ax)，roll = atan2(ay, az)；yaw 无绝对参考 => 置 0。
+     * 符号核对（2026-10-10 实车 θ≈62 deg 那轮）：a_hat=(-0.0905, +0.8755, +0.4748)
+     *   => 反解 roll 61.6 / pitch 5.2 deg，与屏显 61.8 / 5.4 吻合。 */
+    {
+        float ax = s_accel[0], ay = s_accel[1], az = s_accel[2];
+        float n  = sqrtf(ax * ax + ay * ay + az * az);
+        if (n > 1.0f) {                 /* 加计数据有效才用；否则退回旧行为（单位四元数）*/
+            ax /= n; ay /= n; az /= n;
+            float pitch = asinf(fmaxf(-1.0f, fminf(1.0f, -ax)));
+            float roll  = atan2f(ay, az);
+            float cr = cosf(roll  * 0.5f), sr = sinf(roll  * 0.5f);
+            float cp = cosf(pitch * 0.5f), sp = sinf(pitch * 0.5f);
+            q[0] =  cr * cp;            /* w  */
+            q[1] =  sr * cp;            /* x  */
+            q[2] =  cr * sp;            /* y  */
+            q[3] = -sr * sp;            /* z  = 0（yaw 置零）*/
+        } else {
+            q[0] = 1.0f; q[1] = q[2] = q[3] = 0.0f;
+        }
+    }
 
     /* 恒温 PID */
     PID_init(&s_heater_pid, PID_POSITION, s_heater_pid_param,
@@ -748,7 +772,12 @@ void InsTask_Entry(void *argument)
             imu_temp_control(s_temp);
         }
 
-        /* 磁力计 100Hz 读取（每 10 个 1kHz 周期一次）。
+        /* 磁力计读取 = 每 MAG_READ_DIVIDER(10) 个【融合周期】一次。
+         * ⚠️ 2026-10-10 更正：原注释写「100Hz（每 10 个 1kHz 周期一次）」，但本循环
+         *   实际唤醒 ≈1613 Hz（见 INS_FUSION_FREQ_HZ / s_last_fuse_cyc 说明）
+         *   ⇒ **磁读实际 ≈159~161 Hz，不是 100 Hz**。
+         *   （与 A1 同源的问题：凡"按 1 kHz 折算"的注释都不可信。）
+         * 现场判读：用 0x0188(MAG_OK) 增量 / 真实时间 ⇒ 应 ≈ 融合率/10；已用时间戳验证 <2%。
          * 只更新 s_mag 缓存；姿态融合仍每周期跑，磁分量用最近一次值。 */
         if (s_mag_present)
         {

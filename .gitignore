@@ -32,7 +32,11 @@ __pycache__/
 .env.*
 
 # WorkBuddy agent workspace (project memory, not part of firmware)
-.workbuddy/
+# ⚠️ 2026-10-08：工作区曾被整体清空，而 .workbuddy/ 被整目录排除 ⇒
+#    【项目记忆（MEMORY.md / 每日日志 / topics）无处可寻，只能靠对话重建】。
+#    现改为：只排除缓存类子目录，**保留 memory/**，让项目记忆进版本库。
+.workbuddy/*
+!.workbuddy/memory/
 
 # 个人进展 / 待办笔记（2026-09-16 起仅本地保留，不再入库）
 计划.md
@@ -40,3 +44,10 @@ __pycache__/
 
 # 会话间的临时分析稿（2026-09-17 起仅本地保留）
 LUT模型复核*.md
+
+# 本地资料夹（2026-10-10）：文档原稿与硬件手册的本地存放处，整体不入库
+#（含标定手册.md / 计划*.md / ELRS-CRSF协议笔记.md / 各类 PDF 手册）
+words/
+
+# 本地工具脚本（2026-10-10 起仅本地保留）
+tools/
