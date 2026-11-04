@@ -58,7 +58,6 @@
 /* USER CODE END 0 */
 
 /* External variables --------------------------------------------------------*/
-extern DMA_HandleTypeDef hdma_usart3_rx;
 extern UART_HandleTypeDef huart2;
 /* USER CODE BEGIN EV */
 /* HAL 时基由 TIM6 提供（见 Src/stm32f4xx_hal_timebase_tim.c），SysTick 交给 FreeRTOS */
@@ -185,19 +184,6 @@ void SysTick_Handler(void)
 /* For the available peripheral interrupt handler names,                      */
 /* please refer to the startup file (startup_stm32f4xx.s).                    */
 /******************************************************************************/
-
-/**
-  * @brief This function handles DMA1 stream1 global interrupt.
-  */
-void DMA1_Stream1_IRQHandler(void)
-{
-  /* USER CODE BEGIN DMA1_Stream1_IRQn 0 */
-
-  /* USER CODE END DMA1_Stream1_IRQn 0 */
-  /* USER CODE BEGIN DMA1_Stream1_IRQn 1 */
-
-  /* USER CODE END DMA1_Stream1_IRQn 1 */
-}
 
 /* USB CDC 已废弃（CAN 占用 PD0/PD1，不再使用虚拟串口），OTG_FS_IRQHandler 已移除 */
 

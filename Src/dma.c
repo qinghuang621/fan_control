@@ -41,9 +41,7 @@ void MX_DMA_Init(void)
   __HAL_RCC_DMA2_CLK_ENABLE();
 
   /* DMA interrupt init */
-  /* DMA1_Stream1_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA1_Stream1_IRQn, 0, 0);
-  HAL_NVIC_EnableIRQ(DMA1_Stream1_IRQn);
+  /* DMA1_Stream1（原 USART3_RX）已随 USART3/DBUS 一并删除，NVIC 不再使能 */
 
   /* BMI088 SPI1 收发 DMA（DMA2_Stream2=RX / DMA2_Stream3=TX，均为 Channel 3）
    * 优先级 (5,0)：低于 SysTick/FreeRTOS 临界区边界，DMA 完成中断里会调用

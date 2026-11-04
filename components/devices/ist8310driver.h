@@ -22,8 +22,9 @@ typedef struct
 
 extern uint8_t ist8310_init(void);
 extern void ist8310_read_over(uint8_t *status_buf, ist8310_real_data_t *data);
-/* 【临时诊断 2026-09-23】返回 1=成功 / 0=失败；raw 输出原始 16 位计数（不乘 0.3）。
- * 原为 `void ist8310_read_mag(fp32 mag[3])`，且内部 buf 未初始化、不检查读失败。 */
-extern uint8_t ist8310_read_mag(fp32 mag[3], int16_t raw[3]);
+/* 返回 1=成功 / 0=失败。
+ * 原为 `void ist8310_read_mag(fp32 mag[3])`，且内部 buf 未初始化、不检查读失败 ——
+ * 读失败时会解析栈上残留内存，输出"几千 μT"的假读数。返回值改造必须保留。 */
+extern uint8_t ist8310_read_mag(fp32 mag[3]);
 
 #endif

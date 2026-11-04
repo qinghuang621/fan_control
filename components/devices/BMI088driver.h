@@ -104,13 +104,17 @@ extern void BMI088_accel_read_over(uint8_t *rx_buf, fp32 accel[3], fp32 *time);
 extern void BMI088_gyro_read_over(uint8_t *rx_buf, fp32 gyro[3]);
 extern void BMI088_temperature_read_over(uint8_t *rx_buf, fp32 *temperate);
 extern void BMI088_read(fp32 gyro[3], fp32 accel[3], fp32 *temperate);
+extern fp32 get_BMI088_temperate(void);   /* 仍在使用：预热阶段读温度（见 ins_task.c） */
+
+/* ===== 原例程函数，无调用，2026-11-04 停用 =====
+ * 源码保留在 BMI088driver.c 对应的 #if 0 块里，需要时同步改 #if 1。 */
+#if 0
 extern uint32_t get_BMI088_sensor_time(void);
-extern fp32 get_BMI088_temperate(void);
 extern void get_BMI088_gyro(int16_t gyro[3]);
 extern void get_BMI088_accel(fp32 accel[3]);
 
-
 extern void BMI088_read_gyro_who_am_i(void);
 extern void BMI088_read_accel_who_am_i(void);
+#endif
 
 #endif

@@ -139,9 +139,32 @@ static void led_tilt_render(const ins_snapshot_t *s, ins_status_e st,
         return;
     }
     if (st == INS_STATUS_WARMUP) {
-        /* 恒温加热中（姿态已可读但尚未对外）：偏青色慢呼吸，与 OFFLINE 的暗红区分 */
-        float phase = (tick_ms % 1000U) / 1000.f;
-        float v = 0.25f + 0.35f * (0.5f - 0.5f * cosf(phase * TWO_PI_L));
+        /* 恒温加热中：**亮度绑定温度**（越接近目标越亮），再叠一个小幅呼吸。
+         *
+         * 2026-11-04 改：原实现是纯正弦呼吸（0.25~0.60）、与温度完全无关，
+         *   现场看不出"还差多远"，也看不出热量有没有在爬。
+         * 现设计：
+         *   · 亮度主值 = 加热进度 (T - T0) / (Ttarget - T0)，映射到 0.12~0.85；
+         *   · 再乘 0.78~1.0 的慢呼吸 —— 幅度刻意压小，只用来证明任务还活着
+         *     （万一加热卡死，亮度会冻结在某个值不动，反而暴露问题）。
+         *   · 温度无效（快照还没刷出/读到 0）时按 T0 处理，即最暗，不会算出负进度。
+         * 颜色仍为纯青（R=0），与 OFFLINE 的暗红、RUNNING 的姿态色区分。 */
+        float target = ins_get_target_temp();
+        float t_now  = (s->temperature > 1.0f) ? s->temperature : LED_TILT_WARMUP_T0_C;
+        float prog;
+        float phase, breathe, v;
+
+        if (target > (LED_TILT_WARMUP_T0_C + 1.0f)) {
+            prog = (t_now - LED_TILT_WARMUP_T0_C) / (target - LED_TILT_WARMUP_T0_C);
+        } else {
+            prog = 1.0f;   /* 目标温度被改成异常低值：直接按最亮处理，不除零 */
+        }
+        prog = clampf_lohi(prog, 0.f, 1.f);
+
+        phase   = (tick_ms % 1000U) / 1000.f;
+        breathe = 0.78f + 0.22f * (0.5f - 0.5f * cosf(phase * TWO_PI_L));
+        v       = (0.12f + 0.73f * prog) * breathe;
+
         led_set_rgb01(0.f, v, v);
         return;
     }

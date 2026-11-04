@@ -293,30 +293,6 @@ static uint32_t modbus_t35_gap_ms(uint32_t baud)
 #define REG_MAG_Z          0x0182U  /* float32 μT，占 0x0182~0x0183 */
 #define REG_MAG_END        0x0183U
 
-/* ============ 【临时诊断 2026-09-23】磁力计 I2C 读健康度 0x0184~0x018C（只读） ============
- * 为什么加这组：驱动原版读失败时**静默解析栈上残留内存**，输出"几千 μT"的假读数
- * （实测还原出的字节前 4 位正是 float 0.3f 的位模式），而 MAG_STATUS 照报九轴在跑。
- * 定位完**整段删除**（连同 ins_task 快照字段、驱动返回值、0x0184~0x018C 定义）。
- *
- * 判读表：
- *   MAG_ERR 不涨              → I2C 一直成功，问题在别处
- *   MAG_ERR 涨 + HAL=BUSY     → 前一次传输没结束（状态机卡住）
- *   MAG_ERR 涨 + ERRCODE=0x04 → **从机 NACK（AF）** → 器件/上拉/时序问题
- *   MAG_ERR 涨 + ERRCODE=0x01 → BERR，总线噪声（上拉太弱/线太长）
- *   MAG_ERR 涨 + ERRCODE=0x20 → 超时（从机拉死总线 / 时钟被拉低）
- *   MAG_RECOVER 涨            → 【自愈】生效过 —— 毛刺确实发生过，但被自动恢复了
- *   MAG_OK 持续增长           → 链路健康（自愈后能立刻恢复，不再永久卡死） */
-#define REG_MAG_RAW_X      0x0184U  /* int16 原始计数（不乘 0.3） */
-#define REG_MAG_RAW_Y      0x0185U
-#define REG_MAG_RAW_Z      0x0186U
-#define REG_MAG_ERR        0x0187U  /* uint16：I2C 读失败累计 */
-#define REG_MAG_OK         0x0188U  /* uint16：I2C 读成功累计 */
-#define REG_MAG_HAL        0x0189U  /* 最后一次 HAL 返回码：0=OK 1=ERROR 2=BUSY 3=TIMEOUT */
-#define REG_MAG_STATE      0x018AU  /* hi2c3.State：0x20=READY 0x24=BUSY 0xA0=TIMEOUT 0xE0=ERROR */
-#define REG_MAG_ECODE      0x018BU  /* hi2c3.ErrorCode：0x04=AF(NACK) 0x01=BERR 0x02=ARLO 0x20=TIMEOUT */
-#define REG_MAG_RECOVER    0x018CU  /* 【自愈】I2C3 复位次数 —— 直接反映"毛刺发生了多少次" */
-#define REG_MAG_DIAG_END   0x018CU
-
 /* ==================== 运动控制的姿态输出区 0x0190~0x01A7（只读） ====================
  * 2026-09-30 新增。上位机（ROS2）做姿态融合运动控制要四组量，其中两组此前没有：
  *   角速度     → 0x0156~0x015B（已有）· 四元数 → 0x0174~0x017B（已有）
@@ -703,19 +679,18 @@ static uint8_t is_auto_param_region(uint16_t addr)
 
 /* IMU 姿态输出区为只读：上位机写这些地址一律静默忽略（不返回异常码，
  * 保持与既有状态区 0x0040~0x008F 相同的"写无效但不报错"行为，便于上位机统一处理）。
- * 覆盖六段：① `0x0150~0x015F` 姿态/角速度/温度；
+ * 覆盖五段：① `0x0150~0x015F` 姿态/角速度/温度；
  *          ② `0x016E~0x016F` TILT_THETA（float32 实时 θ）；
  *          ③ `0x0174~0x017B` 姿态四元数；
  *          ④ `0x017C~0x0183` IST8310 磁力计（初始错误码 + 原始三轴）；
- *          ⑤ `0x0184~0x018C` 【临时诊断】磁力计 I2C 读健康度（定位完删除）；
- *          ⑥ `0x0190~0x01A7` 线加速度 + 姿态协方差（运动控制用，2026-09-30 新增）。
+ *          ⑤ `0x0190~0x01A7` 线加速度 + 姿态协方差（运动控制用，2026-09-30 新增）。
  * 这些都是每 5ms 被 refresh_imu_registers() 覆盖的实时量，允许写只会静默失效、徒增困惑。 */
 static uint8_t is_imu_status_region(uint16_t addr)
 {
     return ((addr >= REG_IMU_BASE) && (addr <= REG_IMU_END)) ||
            ((addr >= REG_IMU_THETA) && (addr <= (uint16_t)(REG_IMU_THETA + 1U))) ||
            ((addr >= REG_IMU_QUAT_W) && (addr <= REG_IMU_QUAT_END)) ||
-           ((addr >= REG_MAG_INIT_ERR) && (addr <= REG_MAG_DIAG_END)) ||
+           ((addr >= REG_MAG_INIT_ERR) && (addr <= REG_MAG_END)) ||
            ((addr >= REG_IMU_ACCEL_X) && (addr <= REG_IMU_ORICOV_END));
 }
 
@@ -1055,19 +1030,6 @@ static void refresh_imu_registers(void)
     write_float32_le(s_holding_regs, REG_MAG_X, snap.mag_x);
     write_float32_le(s_holding_regs, REG_MAG_Y, snap.mag_y);
     write_float32_le(s_holding_regs, REG_MAG_Z, snap.mag_z);
-
-    /* 【临时诊断 2026-09-23】磁力计 I2C 读健康度（定位完整段删除）。
-     * 这组量把"读不到"从静默变成可观测：ERR 涨不涨、HAL/STATE/ERRCODE 各是什么。 */
-    s_holding_regs[REG_MAG_RAW_X] = (uint16_t)snap.mag_raw_x;
-    s_holding_regs[REG_MAG_RAW_Y] = (uint16_t)snap.mag_raw_y;
-    s_holding_regs[REG_MAG_RAW_Z] = (uint16_t)snap.mag_raw_z;
-    s_holding_regs[REG_MAG_ERR]   = snap.mag_err_cnt;
-    s_holding_regs[REG_MAG_OK]    = snap.mag_ok_cnt;
-    s_holding_regs[REG_MAG_HAL]   = (uint16_t)snap.mag_hal;
-    s_holding_regs[REG_MAG_STATE] = (uint16_t)snap.mag_i2c_state;
-    s_holding_regs[REG_MAG_ECODE] = (uint16_t)snap.mag_i2c_errcode;
-    s_holding_regs[REG_MAG_RECOVER] = snap.mag_recover_cnt;
-
 
     /* 温度 ×10 存为有符号整数（诊断用）。钳位到 int16 范围防溢出。 */
     temp = snap.temperature;

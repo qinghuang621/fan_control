@@ -63,7 +63,6 @@
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
-static void FanTask_Entry(void *argument);
 static void ModbusTask_Entry(void *argument);
 static void PulseTask_Entry(void *argument);
 static void LedTask_Entry(void *argument);
@@ -103,16 +102,6 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 }
 
 /* USER CODE END 0 */
-
-static void FanTask_Entry(void *argument)
-{
-   (void)argument;
-   for (;;)
-   {
-       fan_tick();
-       vTaskDelay(pdMS_TO_TICKS(5U));
-   }
-}
 
 static void ModbusTask_Entry(void *argument)
 {
@@ -177,7 +166,6 @@ int main(void)
   MX_GPIO_Init();
   MX_DMA_Init();
   MX_USART6_RS485_UART_Init();
-  MX_USART3_UART_Init();
   MX_TIM8_Init();
   MX_TIM1_Init();
   MX_SPI1_Init();
@@ -192,8 +180,7 @@ int main(void)
     HAL_TIM_PWM_Start(&htim8, TIM_CHANNEL_2);
     HAL_TIM_PWM_Start(&htim8, TIM_CHANNEL_3);
 
-    /* 上电默认安全状态：EN=0, PWM=0 */
-    fric_en_off();
+    /* 上电默认安全状态：PWM=0 */
     fric_off();
 
     /* 启动 PWM1~PWM4(PE9/PE11/PE13/PE14) 四路 FG 脉冲输入捕获 */
@@ -212,15 +199,13 @@ int main(void)
 
     /* 任务优先级说明（tskIDLE_PRIORITY = 0）：
      *   ModbusTask +4  最高 —— RS485 通信超时敏感，且 CAN 发送跑在这里
-     *   FanTask    +3     风机输出
-     *   InsTask    +3     与 FanTask 同级：姿态解算是风机占空比的前馈来源，
-     *                     但 1kHz 解算本身不紧缺 CPU，同级轮转已足够
+     *   InsTask    +3     姿态解算
      *   PulseTask  +2     FG 脉冲统计
-     *   LedTask    +1     最低 —— 纯装饰，被抢占无影响 */
-    if (xTaskCreate(FanTask_Entry, "FanTask", 256U, NULL, tskIDLE_PRIORITY + 3U, NULL) != pdPASS)
-    {
-        Error_Handler();
-    }
+     *   LedTask    +1     最低 —— 纯装饰，被抢占无影响
+     *
+     * 原 FanTask（+3，风机斜坡软启动）已删除：其入口 fan_set_target() 从未被调用，
+     * 状态机恒为 IDLE、每 5ms 空转一次。风机输出实际由 fan_auto_update() /
+     * sync_fan_outputs_from_regs() 在 ModbusTask 里直接写 CCR。 */
     if (xTaskCreate(ModbusTask_Entry, "ModbusTask", 256U, NULL, tskIDLE_PRIORITY + 4U, NULL) != pdPASS)
     {
         Error_Handler();

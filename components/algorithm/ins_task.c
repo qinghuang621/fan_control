@@ -114,7 +114,6 @@ static volatile uint16_t s_heater_pwm = 0;
 static float s_gyro[3]  = {0};
 static float s_accel[3] = {0};
 static float s_mag[3]   = {0};    /* IST8310 磁力计 μT（100Hz 刷新） */
-static int16_t s_mag_raw[3] = {0};/* 【临时诊断】原始 16 位计数（不乘 0.3） */
 static float s_temp     = 0.0f;
 
 /* IST8310 状态：
@@ -290,18 +289,6 @@ static void publish_snapshot(void)
      * 也会报"九轴在跑"，上位机看到的是假状态。 */
     tmp.mag_active   = mag_nine_axis_active();
     tmp.mag_init_err = s_mag_init_err;
-
-    /* 【临时诊断 2026-09-23】I2C 读健康度（定位完删除）。
-     * 直接取中间层的计数与现场 —— 这样"读失败"就不再是静默的。 */
-    tmp.mag_raw_x      = s_mag_raw[0];
-    tmp.mag_raw_y      = s_mag_raw[1];
-    tmp.mag_raw_z      = s_mag_raw[2];
-    tmp.mag_ok_cnt     = g_mag_i2c_ok;
-    tmp.mag_err_cnt    = g_mag_i2c_err;
-    tmp.mag_hal        = g_mag_i2c_hal;
-    tmp.mag_i2c_state  = g_mag_i2c_state;
-    tmp.mag_i2c_errcode = g_mag_i2c_errcode;
-    tmp.mag_recover_cnt = g_mag_i2c_recover;
 
     s_snap_seq++;                    /* -> 奇数，标志"正在写" */
     __DMB();
@@ -595,7 +582,7 @@ uint8_t ins_init(void)
         s_mag_present = 1U;
         /* 读一次初值；失败也计进 fail_streak —— 否则"初始化自检通过但随后读不到"
          * 会仍被当成九轴可用。 */
-        if (ist8310_read_mag(s_mag, s_mag_raw) == 0U)
+        if (ist8310_read_mag(s_mag) == 0U)
         {
             s_mag_fail_streak = 1U;
         }
@@ -777,8 +764,8 @@ void InsTask_Entry(void *argument)
          *   实际唤醒 ≈1613 Hz（见 INS_FUSION_FREQ_HZ / s_last_fuse_cyc 说明）
          *   ⇒ **磁读实际 ≈159~161 Hz，不是 100 Hz**。
          *   （与 A1 同源的问题：凡"按 1 kHz 折算"的注释都不可信。）
-         * 现场判读：用 0x0188(MAG_OK) 增量 / 真实时间 ⇒ 应 ≈ 融合率/10；已用时间戳验证 <2%。
-         * 只更新 s_mag 缓存；姿态融合仍每周期跑，磁分量用最近一次值。 */
+         * 现场判读：看 `0x014B`（MAG_STATUS）是否降级为 0（六轴）；
+         * 连续失败达 MAG_FAIL_LIMIT 就会自动降级，比读计数器更直接。 */
         if (s_mag_present)
         {
             if (++s_mag_read_div >= MAG_READ_DIVIDER)
@@ -786,7 +773,7 @@ void InsTask_Entry(void *argument)
                 s_mag_read_div = 0U;
                 /* 成功清零、失败累加（饱和到 255，防 8 位回绕）——
                  * 供下面 mag_active 判据与 0x014B 使用。 */
-                if (ist8310_read_mag(s_mag, s_mag_raw) != 0U)
+                if (ist8310_read_mag(s_mag) != 0U)
                 {
                     s_mag_fail_streak = 0U;
                 }

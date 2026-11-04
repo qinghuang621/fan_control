@@ -36,15 +36,9 @@ void ist8310_IIC_write_single_reg(uint8_t reg, uint8_t data)
     HAL_I2C_Mem_Write(&hi2c3, IST8310_IIC_ADDRESS, reg, I2C_MEMADD_SIZE_8BIT, &data, 1, 100);
 }
 
-/* 【临时诊断 2026-09-23】原版是 void 且吞掉了 HAL 返回值 —— 读失败时 buf 保持
+/* 【2026-09-23 修正，必须保留】原版是 void 且吞掉了 HAL 返回值 —— 读失败时 buf 保持
  * 原样，调用方却照常解析，于是输出"看起来像巨大磁场的垃圾"，且 MAG_STATUS 仍报
- * 九轴在跑，故障完全静默。现返回状态并把 I2C 现场记录下来。 */
-volatile uint16_t g_mag_i2c_ok      = 0U;
-volatile uint16_t g_mag_i2c_err     = 0U;
-volatile uint8_t  g_mag_i2c_hal     = 0U;   /* HAL_StatusTypeDef */
-volatile uint8_t  g_mag_i2c_state   = 0U;   /* hi2c3.State */
-volatile uint8_t  g_mag_i2c_errcode = 0U;   /* hi2c3.ErrorCode */
-volatile uint16_t g_mag_i2c_recover = 0U;   /* 【自愈】I2C3 复位次数 */
+ * 九轴在跑，故障完全静默。现返回 1=成功 / 0=失败，由调用方决定是否沿用旧值。 */
 
 /* 【自愈 2026-09-23】连续失败达到此值就复位 I2C3。
  * 取 3 的理由：单次孤立失败（毛刺但没卡死）不会触发（下一次就成功了），
@@ -104,7 +98,6 @@ void ist8310_i2c_recover(void)
 
     ist8310_delay_ms(2U);           /* 从机刚被折腾过，给点内部稳定时间 */
 
-    g_mag_i2c_recover++;
     s_mag_i2c_fail_run = 0U;
 }
 
@@ -113,16 +106,11 @@ uint8_t ist8310_IIC_read_muli_reg(uint8_t reg, uint8_t *buf, uint8_t len)
     HAL_StatusTypeDef st = HAL_I2C_Mem_Read(&hi2c3, IST8310_IIC_ADDRESS, reg,
                                             I2C_MEMADD_SIZE_8BIT, buf, len, 100);
 
-    g_mag_i2c_hal     = (uint8_t)st;
-    g_mag_i2c_state   = (uint8_t)hi2c3.State;
-    g_mag_i2c_errcode = (uint8_t)hi2c3.ErrorCode;
-
     if (st != HAL_OK)
     {
-        g_mag_i2c_err++;
-
         /* 【自愈】STM32F4 的 I2C 一旦被毛刺打到 BUSY 卡死，HAL 只会永远回 HAL_BUSY，
-         * 不主动复位就是【永久失效】—— 实测 MAG_OK 会一直冻结在卡死那一刻。 */
+         * 不主动复位就是【永久失效】—— 实测表现为磁读数永久冻结。
+         * ⚠️ 判据是"连续失败"，不是"失败总数"：单次毛刺下一次就成功，计数会清零。 */
         if (++s_mag_i2c_fail_run >= MAG_I2C_FAIL_LIMIT)
         {
             ist8310_i2c_recover();
@@ -131,7 +119,6 @@ uint8_t ist8310_IIC_read_muli_reg(uint8_t reg, uint8_t *buf, uint8_t len)
     }
 
     s_mag_i2c_fail_run = 0U;
-    g_mag_i2c_ok++;
     return 1U;
 }
 

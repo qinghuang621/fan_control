@@ -358,6 +358,13 @@ bool_t bmi088_gyro_self_test(void)
     return BMI088_NO_ERROR;
 }
 
+/* ============================================================================
+ * 以下 2 个为**原例程函数，无调用**，2026-11-04 停用（保留源码，需要时改 #if 1）
+ * 来源：DJI RoboMaster 开发板 C 型官方 BMI088driver 模板。
+ * 用途：读 WHO_AM_I 后通过宏打印，用于排查 SPI 通信；本工程未定义打印宏，
+ *       原函数里靠 (void)buf 抑制"赋值未使用"警告，等于什么都没做。
+ * ========================================================================== */
+#if 0
 void BMI088_read_gyro_who_am_i(void)
 {
     /* 调试辅助函数：读到的 WHO_AM_I 通过宏打印。
@@ -375,6 +382,7 @@ void BMI088_read_accel_who_am_i(void)
     BMI088_accel_read_single_reg(BMI088_ACC_CHIP_ID, buf);
     (void)buf;
 }
+#endif /* 原例程函数，无调用 */
 
 
 
@@ -455,6 +463,12 @@ void BMI088_read(fp32 gyro[3], fp32 accel[3], fp32 *temperate)
     *temperate = bmi088_raw_temp * BMI088_TEMP_FACTOR + BMI088_TEMP_OFFSET;
 }
 
+/* ============================================================================
+ * 以下为**原例程函数，无调用**，2026-11-04 停用（保留源码，需要时改 #if 1）
+ * get_BMI088_sensor_time：读 BMI088 内部 SENSORTIME 计数器。本工程时间基用
+ *   DWT_CYCCNT（见 Mahony 时间基 A1 改造），不需要传感器时间戳。
+ * ========================================================================== */
+#if 0
 uint32_t get_BMI088_sensor_time(void)
 {
     uint32_t sensor_time = 0;
@@ -465,6 +479,7 @@ uint32_t get_BMI088_sensor_time(void)
 
     return sensor_time;
 }
+#endif /* 原例程函数，无调用 */
 
 fp32 get_BMI088_temperate(void)
 {
@@ -486,6 +501,16 @@ fp32 get_BMI088_temperate(void)
     return temperate;
 }
 
+/* ============================================================================
+ * 以下 2 个为**原例程函数，无调用**，2026-11-04 停用（保留源码，需要时改 #if 1）
+ * 本工程改成了「一次读全」：ins_task.c 的 `BMI088_read(s_gyro, s_accel, &s_temp)`
+ * 一条 SPI 事务把加速度 + 陀螺 + 温度全读回（加速度 6 B + 陀螺 8 B + 温度 2 B），
+ * 比按需调 get_BMI088_gyro/accel 各发一次事务更省。
+ * ⚠️ 语义差异（以后恢复时注意）：
+ *   `get_BMI088_gyro()` 输出的是**原始 int16 计数**，未乘 BMI088_GYRO_SEN；
+ *   `BMI088_read()` 输出的是 rad/s。两者不能混用。
+ * ========================================================================== */
+#if 0
 void get_BMI088_gyro(int16_t gyro[3])
 {
     uint8_t buf[6] = {0, 0, 0, 0, 0, 0};
@@ -515,6 +540,7 @@ void get_BMI088_accel(fp32 accel[3])
     accel_raw_temp = (int16_t)((buf[5]) << 8) | buf[4];
     accel[2] = accel_raw_temp * BMI088_ACCEL_SEN;
 }
+#endif /* 原例程函数，无调用 */
 
 #if defined(BMI088_USE_SPI)
 
