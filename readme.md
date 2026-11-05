@@ -13,7 +13,7 @@
 
 硬件平台：**STM32F407IGH6**（UFBGA176 封装，1 MB Flash / 128 KB SRAM + 64 KB CCMRAM）——
 以 `.ioc` 的 `Mcu.CPN` 与 `STM32F407xx_FLASH.ld` 的存储器布局为准。
-软件架构：FreeRTOS **5 个任务**（`ModbusTask` / `FanTask` / `InsTask` / `PulseTask` / `LedTask`），1 ms HAL 时基（TIM6）+ FreeRTOS SysTick 节拍（`xPortSysTickHandler`），Cortex-M4F 168 MHz。
+软件架构：FreeRTOS **4 个任务**（`ModbusTask` / `InsTask` / `PulseTask` / `LedTask`，按优先级降序），1 ms HAL 时基（TIM6）+ FreeRTOS SysTick 节拍（`xPortSysTickHandler`），Cortex-M4F 168 MHz。
 
 ### 参考资料
 
@@ -67,16 +67,11 @@
 默认串口参数：**115200, 8N1**，从站地址 **1**（可由寄存器 `0x0091` 改为 1~247，写 0 或 >247 回退 1）。
 波特率/校验可由寄存器 `0x0090` 枚举改（8 种组合，见接口文档 §7.2），上电读一次，复位生效。
 
-> 历史：早期版本走 USART2（PA2/PA3）；后短暂改为 USART1（4-Pin 口）；最终确定用 3-Pin 口，
-> MCU 侧为 USART6。
-
-> **RS485 收发实现**：**不使用 HAL UART 中断状态机**，
-> 而是在 `USART6_IRQHandler` 里裸寄存器自管：RXNE 读 DR 入环形 FIFO、**每次中断都清 ORE/FE/NE/PE**、
-> TXE 逐字节发送、**TC 中断才切回接收方向**（PG8）。这样从架构上消除了
-> "HAL 逐字节接收遇 ORE 溢出后永久停摆"与"发送未移完就拉低方向脚截断末字节"两个隐患。
->
-> ⚠️ **但 PG8 在 C 板上未引出**（见 §2.2 接线表）：这段方向控制逻辑**当前在硬件上不起作用**，
-> 方向完全由外部模块的自动收发电路决定。代码**保留** —— 换用带 `DE` 脚的模块后飞线即可生效，无需改代码。
+> **RS485 收发实现**：不使用 HAL UART 中断状态机，而是在 `USART6_IRQHandler` 里裸寄存器自管：
+> RXNE 读 DR 入环形 FIFO、每次中断都清 ORE/FE/NE/PE、TXE 逐字节发送、TC 中断才切回接收方向。
+> 这样从架构上消除了"ORE 溢出后永久停摆"与"末字节未移完就切方向"两个隐患。
+> ⚠️ 但 PG8 未引出（见 §2.2），方向实际由外部模块的自动收发电路决定；这段代码保留，
+> 换用带 `DE` 脚的模块后飞线即可生效。
 
 ### 2.3 CAN1 总线
 
@@ -93,27 +88,26 @@
 `CAN1_RX0` 中断里 `HAL_CAN_RxFifo0MsgPendingCallback` **只把帧写入 FreeRTOS 队列**，
 寄存器更新在任务上下文完成。
 
-> **重要**：早期版本曾把 CAN1 配到 PA11/PA12，那两个脚实际是 USB_OTG_FS_DM/DP。**C 板的 CAN1 在 PD0/PD1**，以 RoboMaster C 板用户手册为准。
+> **C 板的 CAN1 在 PD0/PD1**（PA11/PA12 是 USB_OTG_FS 的 DM/DP，别接错）。
 
-## 3. 软件架构（FreeRTOS 5 任务）
+## 3. 软件架构（FreeRTOS 4 任务）
 
 | 任务 | 周期 | 优先级 | 职责 |
 |------|------|--------|------|
 | ModbusTask | 5 ms | +4 | RS485 帧解析（裸寄存器中断收发）、Modbus 03/06/10/04 协议、**风机占空比输出**（自动前馈 / 手动跟随）、CAN 电机发送（HAL API）、CAN 接收队列排空、心跳超时、参数落盘 |
-| FanTask    | 5 ms | +3 | 调 `fan_tick()` —— ⚠️ **当前为空转**：它驱动的斜坡状态机（`bsp_fric.c`）恒为 `IDLE`，因为 `fan_set_target()` / `fan_stop()` **全工程无人调用**。风机输出实际由 ModbusTask 完成 |
 | InsTask    | ~1 ms（DRDY 驱动）| +3 | BMI088 采样 + IST8310 磁场读取（100 Hz）→ Mahony **九轴**姿态解算 → 发布 seqlock 快照；恒温 PID（TIM10）；栈 512 字（含 sqrt/atan2 浮点库调用） |
 | PulseTask  | 10 ms| +2 | 500 ms 窗口 FG 测频、RPM 计算 |
 | LedTask    | 5 ms | +1 | RGB 倾斜指示灯（色相=倾斜方向，饱和度=幅度，亮度=系统状态） |
 
-> ⚠️ **风机输出的真实路径**：`ModbusTask` → `modbus_poll()` → `fan_auto_update()`（自动模式，
-> 每 5 ms 算一次并直接写 TIM8 CCR）/ `sync_fan_outputs_from_regs()`（手动模式，跟随 `0x0100~0x0103`）。
-> **不要以为是 FanTask 在输出** —— 它那套斜坡逻辑目前没有被接上。
+> **风机输出只在 `ModbusTask` 里发生**：`modbus_poll()` → `fan_auto_update()`（自动模式，每 5 ms
+> 算一次并直接写 TIM8 CCR）或 `sync_fan_outputs_from_regs()`（手动模式，跟随 `0x0100~0x0103`）。
+> **没有第二个输出点。**
 
 时基分工：
 
 - **SysTick**（1 kHz）→ FreeRTOS 节拍，由 `SysTick_Handler` 自实现（`Src/stm32f4xx_it.c`），不在编译 `cmsis_os2.c` 的前提下提供 `xPortSysTickHandler()`。
 - **TIM6**（1 kHz）→ HAL 时基，由 `Src/stm32f4xx_hal_timebase_tim.c` 提供 `HAL_InitTick()`，优先级 15（最低）。
-- 已用定时器：TIM1（FG 捕获）、TIM5（bsp_led 自用）、TIM6（HAL 时基）、TIM8（风机 PWM）。
+- 已用定时器：TIM1（FG 捕获）、TIM5（bsp_led 自用）、TIM6（HAL 时基）、TIM8（风机 PWM）、TIM10（BMI088 恒温加热 PWM，CH1/PF6）。
 
 ## 4. 通信协议概要
 
@@ -141,9 +135,8 @@
 | 0x017C~0x018C | IST8310 磁力计诊断（初始化错误码 / 磁场三轴 / I2C 读健康度）；**九轴融合的链路判据** | R |
 | `0x0190~0x01A7` | **运动控制输出**：线加速度（3×float32，**比力含重力**）+ 姿态协方差 3×3（float32 ×9，rad²，行主序）| R |
 
-> **断电保持区 = `0x0090~0x0173` 整段**（2026-09-15 由 `0x0090~0x00BF` 扩展；
-> 2026-09-16 修复"CRC 把自身算进校验范围"导致**断电保持从未生效**的 bug，`VERSION` 升为 **3**，见 `接口文档.md` §7.3）。
-> 四元数（`0x0174~0x017B`）**刻意放在保持区之外** —— 它是每 5 ms 刷新的实时量，持久化没有意义。
+> **断电保持区 = `0x0090~0x0173` 整段**（`FLASH_RETENTIVE_VERSION = 3`；旧镜像会被拒、首次上电回默认值，
+> 属正常）。四元数（`0x0174~0x017B`）**刻意放在区外** —— 每 5 ms 刷新的实时量，持久化没有意义。
 
 **Modbus 功能码支持**：0x03（读保持寄存器）、0x04（读输入寄存器，复用 0x03 语义）、0x06（写单寄存器）、0x10（写多寄存器）。
 
@@ -154,7 +147,9 @@
 
 ## 5. 运动学解算
 
-底盘为**正交全向轮**：LF/RR 是 X 轮（只吃 vx），RF/LR 是 Y 轮（只吃 vy），中心布局 **0.36 m × 0.36 m**，轮半径 **0.0375 m**（**37.5 mm = 半径**，2026-10-08 长老确认；此前"若是直径"的疑问已消除）。**最大轮速 ±50 rad/s，等比例限幅**（纯安全钳位）。⚠️ 新几何下上位机 Fast 档最坏组合 vx=2.0 / vy=1.2 / wz=4.0 会到 **72.5 rad/s**、**触发限幅**（缩到约 0.69 倍）；旧几何（0.15 / 0.15 / 0.05）时该组合只到 46.0 rad/s、全程不触发。50 这个上限由电机额定 600 rpm ≈ 62.8 rad/s 反推得出，**不要为提高 Fast 档速度而突破它**。
+底盘为**正交全向轮**：LF/RR 是 X 轮（只吃 vx），RF/LR 是 Y 轮（只吃 vy），中心距 **0.36 m × 0.36 m**，轮半径 **0.0375 m**。**最大轮速 ±50 rad/s，等比例限幅**（由电机额定 600 rpm ≈ 62.8 rad/s 反推，**别为提高速度突破它**）。
+
+⚠️ 上位机 Fast 档最坏组合 vx=2.0 / vy=1.2 / wz=4.0 可达 **72.5 rad/s**，会**触发限幅**（缩到约 0.69 倍）。
 
 通信丢失保护：上位机每次写 0x0014~0x0019 刷新心跳；500 ms 内无新命令强制 4 轮速度为 0，NaN/Inf 视为 0。
 
@@ -195,7 +190,7 @@
 - 风机 2 → PWM6 (TIM8_CH2, PI6)
 - 风机 3 + 风机 4 → PWM7 (TIM8_CH3, PI7)，取两者较大值
 
-**占空比的来源有两条路，都在 `ModbusTask` 里每 5 ms 执行一次**（`modbus_poll()`，**不是 FanTask**）：
+**占空比的来源有两条路，都在 `ModbusTask` 里每 5 ms 执行一次**（`modbus_poll()`）：
 
 | 模式 | 条件 | 输出 |
 |---|---|---|
@@ -206,8 +201,10 @@
 前馈的两套模型与标定见 `标定手册.md` §3（线性，仅 [0°,90°]）与 §8（LUT，覆盖 [0°,180°]）。
 当前占空比读 `0x015C`（`AUTO_DUTY`，float32）。
 
-> ⚠️ **`FanTask` 目前不参与输出** —— 它只调 `fan_tick()`，而那个斜坡状态机恒为 `IDLE`
-> （`fan_set_target()` / `fan_stop()` 全工程无人调用）。**别被任务名误导。**
+> **软启动（斜坡）目前没有实现。** `bsp_fric.c` 只有三个函数：`fric_set_channel_duty()` /
+> `fric_get_channel_duty()` / `fric_off()`，占空比直写 CCR、无斜坡。
+> 若要加，**做进 `fric_set_channel_duty()` 内部**（四路各自独立，自动/手动两条路径都能覆盖），
+> 不要用"任务轮询 + 三路同值"的写法。
 
 **FG 测速**：`PulseTask` 每 10 ms 累计 FG 脉冲，每 500 ms 窗口算 RPM，通过
 `pulse_get_freq_hz()` / `pulse_get_rpm()` / `pulse_get_pulse_count()` 读取（`bsp/boards/bsp_pulse.c`）。
@@ -222,11 +219,10 @@ cmake --preset Debug
 cmake --build build/Debug -- -j 8
 ```
 
-产物：`build/Debug/pwm_snail.{elf,hex,bin}`，当前约 **74 KB Flash / 29 KB RAM**
-（`RAM 29848 B (22.77%) / FLASH 75436 B (7.19%)`）。烧录用 ST-Link 即可
-（`openocd.cfg` 与 `.vscode/tasks.json` 里有现成的构建 / 烧录 / 调试任务）。
+产物：`build/Debug/pwm_snail.{elf,hex,bin}`，当前约 **86 KB Flash / 29 KB RAM**（精确值以构建输出为准）。
+烧录用 ST-Link 即可（`openocd.cfg` 与 `.vscode/tasks.json` 里有现成的构建 / 烧录 / 调试任务）。
 
-**工具链现状（2026-09-15 起）** —— 三个组件都是独立安装的，**不需要 STM32CubeIDE**：
+**工具链** —— 三个组件都是独立安装的，**不需要 STM32CubeIDE**：
 
 | 组件 | 位置 | 备注 |
 |---|---|---|
@@ -234,42 +230,39 @@ cmake --build build/Debug -- -j 8
 | Ninja 1.13.2 | `D:\stm32\nijia\ninja.exe` | 目录名就是 "nijia"（非笔误）|
 | arm-none-eabi-gcc 12.2.1 | `D:\stm32\Arm GNU Toolchain arm-none-eabi\12.2 mpacbti-rel1\bin` | 工具链文件要求它在 PATH 中 |
 
-> ⚠️ 曾出现"ninja 报 `Re-running CMake... CreateProcess failed`"——原因是 `build.ninja` 里
-> `RERUN_CMAKE` 边依赖的 CMake 模块文件随 STM32CubeIDE 一起被删了。**装回独立 CMake 后
-> `cmake --preset Debug` 会自动重生 `build.ninja`、恢复该边。**
+> ⚠️ 若 ninja 报 `Re-running CMake... CreateProcess failed`，是 `build.ninja` 依赖的 CMake 模块路径失效；
+> `cmake --preset Debug` 会重生它。
 
 > ⚠️ **不要再用 `pwm_snail.ioc` 重新生成代码。** 该 `.ioc` 停留在移植初期，
 > **重新生成会覆盖 `main.c` / `gpio.c` / `usart.c` / `tim.c`**，
 > 抹掉手改的 **PG0 EXTI 配置**（IMU 采集链路的命门）、**USART6 裸寄存器收发**、
 > **TIM10 恒温 PWM** 等 —— 这些都不在 CubeMX 的表达能力之内。
 > `.ioc` 现在只作**引脚分配参考**保留，真值以 `Src/` 下的代码为准。
-> （同理，`MDK-ARM/` Keil 工程已删除，本项目只用 CMake + GCC 工具链。）
 
 ## 9. 当前状态
 
 已具备的能力：
 
 - 4 路 FG 反馈采集（TIM1_CH1~CH4 输入捕获，500 ms 测频）+ 3 路 20 kHz PWM 输出（TIM8_CH1~CH3）
-- FreeRTOS 5 任务（ModbusTask / InsTask / FanTask / PulseTask / LedTask），1 ms SysTick + 1 ms TIM6 HAL 时基
+- FreeRTOS 4 任务（ModbusTask / InsTask / PulseTask / LedTask），1 ms SysTick + 1 ms TIM6 HAL 时基
 - RS485 Modbus RTU 从站（03/04/06/10，0x0100 风机 + 0x0000 电机双区）
 - 1 Mbps CAN 电机控制（PD0/PD1，AF9）+ 正交全向轮运动学解算
 - 通信丢失保护 / NaN 防护 / 500 ms 心跳超时
 - 参数区 Flash A/B 双区断电保持，2 s 落盘防抖（`crc` 置于镜像块末尾，`FLASH_RETENTIVE_VERSION = 3`）
-- IMU **九轴**姿态解算（BMI088 + IST8310 + Mahony）+ 陀螺零偏/温度闭环。`0x014A`=1 且磁力计在线、读数健康时走九轴（yaw 有磁北参考、不再单向漂移），否则**自动回退六轴**；`0x014B` 可读当前实际走的是哪一路。姿态输出到 `0x0150~0x015F`
-  （欧拉角/角速度/`0x015C` 前馈占空比/状态/温度）、`0x016E~0x016F`（实时总倾角 θ）、
-  `0x0174~0x017B`（姿态四元数，机体系→世界系，无万向节死锁，做算法优先用它）、
-  `0x0190~0x01A7`（运动控制用：线加速度 3×float32 + 姿态协方差 3×3；
-  ⚠️ 线加速度是「比力」含重力；协方差 σ 可经 `0x00C0~0x00C5` 现场调，见 `接口文档.md` §6.10）
-  磁力计接线、I2C 降速原因、上电核对与未做的校准见 `接口文档.md` §6.9
+- IMU **九轴**姿态解算（BMI088 + IST8310 + Mahony）+ 恒温闭环。`0x014A`=1 且磁力计在线、读数健康时
+  走九轴（yaw 有磁北参考），否则**自动回退六轴**；`0x014B` 读出当前实际走的是哪一路。
+- 姿态输出：欧拉角 / 角速度 / 前馈占空比 / 状态 / 温度 `0x0150~0x015F`、实时倾角 θ `0x016E~0x016F`、
+  四元数 `0x0174~0x017B`（机体系→世界系，无万向节死锁，做算法优先用它）、
+  线加速度 + 姿态协方差 `0x0190~0x01A7`（⚠️ 加速度是**比力、含重力**；σ 经 `0x00C0~0x00C5` 调，
+  见 `接口文档.md` §6.10）。磁力计接线与 I2C 降速原因见 §6.9
 - 风机自动模式：由 roll/pitch 前馈计算占空比。**两套模型**：
   `FAN_MODE=1` 线性（`duty = DUTY_FLAT + SLOPE_GAIN×(1−cosθ)`，参数区 `0x0140~0x014F`，**只适用 [0°,90°]**）；
   `FAN_MODE=2` **查表 LUT**（`0x0160~0x016D`，覆盖 θ ∈ [0°,180°]，**风洞外围爬行用这个**）。
   详见 `标定手册.md` §8。
 - 预热期安全兜底：自动模式下若 IMU 尚未进入 RUNNING，输出 **θ=0° 档位**（而非 0），
   保证预热那几秒有基础吸附、且与接管后输出连续不跳变。
-- 恒温 PID：温度一到 `目标 − 2℃` 即交 PID（不再等"连续确认达标"）。
-  **24V 供电下约 2 s 升到 45℃ 目标**（实测）；峰值 46.9℃ 即回落，已接近"无制冷手段"下的物理下限
-  （完全停加热阈值 = `目标 + Iout/Kp = 46.4℃`）。
+- 恒温 PID：**24V 供电下约 2 s 升到 45℃ 目标**，稳态波动约 ±0.2℃。
+  完全停加热阈值 = `目标 + Iout/Kp`（默认参数下 46.4℃），这是"无制冷手段"下的物理下限。
 
 剩余项（按后续计划）：
 
@@ -285,7 +278,7 @@ cmake --build build/Debug -- -j 8
 
 ## 10. 上层使用提示（避坑）
 
-- **风机占空比从 0x0000 改到 0x0100 了**。旧版上位机/示例若读 0x0000 寄存器，会拿到电机使能位（不是风机占空比），请同步更新。
+- **风机占空比在 `0x0100~0x0103`**；`0x0000~0x0003` 是电机使能位，读错会拿到 0/1 而不是占空比。
 - **CAN1 引脚是 PD0/PD1**，不是 PA11/PA12。早期示例若按 PA11/PA12 接线需改线。
 - **不要直接写电机速度寄存器 0x000A~0x0011**，会被运动学解算结果覆盖。应只发 0x0014~0x0019（vy/vx/wz）。
 - **心跳**：建议上位机每 50 ms 写一次 0x0014~0x0019，即使速度不变也要写，否则 500 ms 后会被强制停车。

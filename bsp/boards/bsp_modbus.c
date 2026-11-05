@@ -103,11 +103,7 @@ static volatile uint16_t s_tx_pos = 0U;
 #define REG_MOTOR_VY_HI 0x0014U
 #define REG_MOTOR_VX_HI 0x0016U
 #define REG_MOTOR_WZ_HI 0x0018U
-#define REG_MOTOR_CMD_COUNT 6U
 #define REG_MOTOR_STATUS_M1 0x0064U
-#define REG_MOTOR_STATUS_M2 0x006EU
-#define REG_MOTOR_STATUS_M3 0x0078U
-#define REG_MOTOR_STATUS_M4 0x0082U
 #define REG_MOTOR_STATUS_STRIDE 10U
 #define REG_MOTOR_TX_ID_BASE 0x201U
 
@@ -157,7 +153,6 @@ static const uint8_t c_cmd_clear_err[8] = {0xFFU, 0xFFU, 0xFFU, 0xFFU, 0xFFU, 0x
 #define REG_FAN_STATUS_STRIDE 10U
 #define REG_CAN_STATUS_BASE 0x0040U
 #define REG_CAN_STATUS_END 0x008FU
-#define REG_STATUS_STRIDE 10U
 #define REG_PARAM_BASE 0x0090U
 #define REG_PARAM_END 0x00BFU
 #define REG_PARAM_UART_CFG 0x0090U
@@ -317,7 +312,6 @@ static uint32_t modbus_t35_gap_ms(uint32_t baud)
 #define REG_COV_SIGMA_ROLL  0x00C0U  /* float32 deg，默认 1.0 */
 #define REG_COV_SIGMA_PITCH 0x00C2U  /* float32 deg，默认 1.0 */
 #define REG_COV_SIGMA_YAW   0x00C4U  /* float32 deg，默认 10.0（yaw 未标定前差得多） */
-#define REG_COV_SIGMA_END   0x00C5U
 
 #define COV_SIGMA_ROLL_DEF   1.0f
 #define COV_SIGMA_PITCH_DEF  1.0f
@@ -412,9 +406,11 @@ _Static_assert((REG_PARAM_BASE + FLASH_RETENTIVE_PARAM_COUNT - 1U) == REG_RETENT
 
 static void motor_can_poll_rx(void);
 
-/* 前置声明：refresh_imu_registers()（文件中部）要用它读协方差 σ，
- * 而它的定义在文件后半的 float32 辅助函数区 —— 不前置会变成隐式声明（C 里按 int 返回）。 */
+/* 前置声明：refresh_imu_registers() / update_status_registers()（文件中部）要用这两个
+ * float32 辅助函数，而它们的定义在文件后半的 float32 辅助函数区 ——
+ * 不前置会变成隐式声明（C 里按 int 返回）。 */
 static float read_float32_regs(const uint16_t *regs, uint16_t addr);
+static void write_float32_regs(uint16_t *regs, uint16_t addr, float value);
 
 static uint16_t crc16_update(uint16_t crc, uint8_t byte)
 {
@@ -645,19 +641,6 @@ static uint16_t clamp_duty(uint16_t v)
     return v;
 }
 
-static void write_float32_le(uint16_t *regs, uint16_t addr, float value)
-{
-    union
-    {
-        float f;
-        uint32_t u32;
-    } conv;
-
-    conv.f = value;
-    regs[addr] = (uint16_t)((conv.u32 >> 16U) & 0xFFFFU);
-    regs[(uint16_t)(addr + 1U)] = (uint16_t)(conv.u32 & 0xFFFFU);
-}
-
 static uint8_t is_can_status_region(uint16_t addr)
 {
     return (addr >= REG_CAN_STATUS_BASE) && (addr <= REG_CAN_STATUS_END);
@@ -740,9 +723,9 @@ static void refresh_fan_state_registers(void)
          */
         s_holding_regs[status_base + 0U] = (uint16_t)(duty > 0U ? 1U : 0U);
         s_holding_regs[status_base + 1U] = 0U;
-        write_float32_le(s_holding_regs, status_base + 2U, (float)pulse_cnt);
-        write_float32_le(s_holding_regs, status_base + 4U, (float)rpm);
-        write_float32_le(s_holding_regs, status_base + 6U, (float)duty);
+        write_float32_regs(s_holding_regs, status_base + 2U, (float)pulse_cnt);
+        write_float32_regs(s_holding_regs, status_base + 4U, (float)rpm);
+        write_float32_regs(s_holding_regs, status_base + 6U, (float)duty);
         /* +8/+9 恒 0：风机无温度通道。留 0 而不是留"外推值"——
          * 0 一眼就知道"没这个数据"，而 80/120 会被当成真值（比如误做过热保护）。 */
         s_holding_regs[status_base + 8U] = 0U;
@@ -947,19 +930,19 @@ static void refresh_imu_registers(void)
      * 后果：seqlock 一抖动，0x015C 就停更（表现为读数冻结在上一次的值）。
      * ⚠️ 注意它必须在 `fan_auto_update()` 之后调用才有意义 —— 调用点在 modbus_poll() 里
      * 紧跟 fan_auto_update()，顺序已保证。 */
-    write_float32_le(s_holding_regs, REG_IMU_AUTO_DUTY, (float)fan_auto_duty);
+    write_float32_regs(s_holding_regs, REG_IMU_AUTO_DUTY, (float)fan_auto_duty);
 
     if (!INS_get_snapshot(&snap))
     {
         return;   /* 姿态数据正在更新，下轮再来 */
     }
 
-    write_float32_le(s_holding_regs, REG_IMU_ROLL,     snap.roll);
-    write_float32_le(s_holding_regs, REG_IMU_PITCH,    snap.pitch);
-    write_float32_le(s_holding_regs, REG_IMU_YAW,      snap.yaw);
-    write_float32_le(s_holding_regs, REG_IMU_GYRO_X,   snap.gyro_x);
-    write_float32_le(s_holding_regs, REG_IMU_GYRO_Y,   snap.gyro_y);
-    write_float32_le(s_holding_regs, REG_IMU_GYRO_Z,   snap.gyro_z);
+    write_float32_regs(s_holding_regs, REG_IMU_ROLL,     snap.roll);
+    write_float32_regs(s_holding_regs, REG_IMU_PITCH,    snap.pitch);
+    write_float32_regs(s_holding_regs, REG_IMU_YAW,      snap.yaw);
+    write_float32_regs(s_holding_regs, REG_IMU_GYRO_X,   snap.gyro_x);
+    write_float32_regs(s_holding_regs, REG_IMU_GYRO_Y,   snap.gyro_y);
+    write_float32_regs(s_holding_regs, REG_IMU_GYRO_Z,   snap.gyro_z);
 
     /* 实时总倾角 θ = acos(cos(pitch−off)·cos(roll−off))，单位度，范围 0~180。
      * **专为 LUT 标定加的**：标定时需要知道"现在摆到几度了"，
@@ -972,17 +955,17 @@ static void refresh_imu_registers(void)
         float ct = cosf(p_off * LUT_DEG2RAD) * cosf(r_off * LUT_DEG2RAD);
         if (ct < -1.0f) { ct = -1.0f; }
         if (ct >  1.0f) { ct =  1.0f; }
-        write_float32_le(s_holding_regs, REG_IMU_THETA, acosf(ct) * LUT_RAD2DEG);
+        write_float32_regs(s_holding_regs, REG_IMU_THETA, acosf(ct) * LUT_RAD2DEG);
     }
 
     /* 姿态四元数，顺序 (w,x,y,z)、机体系→世界系。**原样上抛，不做任何转换**：
      * 没有万向节死锁（欧拉角的 pitch 被 asin 限死在 ±90°），信息也完整，
      * 上位机可自行换算成欧拉角/旋转矩阵/轴角，ROS2 更是原生就用四元数。
      * ⚠️ ROS2 的 geometry_msgs/Quaternion 字段顺序是 (x,y,z,w)，与本表**相反**。 */
-    write_float32_le(s_holding_regs, REG_IMU_QUAT_W, snap.quat_w);
-    write_float32_le(s_holding_regs, REG_IMU_QUAT_X, snap.quat_x);
-    write_float32_le(s_holding_regs, REG_IMU_QUAT_Y, snap.quat_y);
-    write_float32_le(s_holding_regs, REG_IMU_QUAT_Z, snap.quat_z);
+    write_float32_regs(s_holding_regs, REG_IMU_QUAT_W, snap.quat_w);
+    write_float32_regs(s_holding_regs, REG_IMU_QUAT_X, snap.quat_x);
+    write_float32_regs(s_holding_regs, REG_IMU_QUAT_Y, snap.quat_y);
+    write_float32_regs(s_holding_regs, REG_IMU_QUAT_Z, snap.quat_z);
 
     /* ---- 运动控制区 0x0190~0x01A7（2026-09-30 新增）----
      * ① 线加速度：机体系**比力**，原样上抛、**不减去重力**（理由见 REG_IMU_ACCEL_X 定义处）。
@@ -993,9 +976,9 @@ static void refresh_imu_registers(void)
      *                    —— 本机水平分量只有 ~25 μT，5 μT 偏置即 ~12° 误差。
      *    σ 现场可改（0x00C0~0x00C5，单位【度】，断电保持），改完立刻生效、无需重烧固件。
      *    ⚠️ 这是"能用的起点"，**不是标定结果**；做完磁标定后应据实测收窄（见 `计划2.md` §2.4）。 */
-    write_float32_le(s_holding_regs, REG_IMU_ACCEL_X, snap.accel_x);
-    write_float32_le(s_holding_regs, REG_IMU_ACCEL_Y, snap.accel_y);
-    write_float32_le(s_holding_regs, REG_IMU_ACCEL_Z, snap.accel_z);
+    write_float32_regs(s_holding_regs, REG_IMU_ACCEL_X, snap.accel_x);
+    write_float32_regs(s_holding_regs, REG_IMU_ACCEL_Y, snap.accel_y);
+    write_float32_regs(s_holding_regs, REG_IMU_ACCEL_Z, snap.accel_z);
     {
         float s_r = read_float32_regs(s_holding_regs, REG_COV_SIGMA_ROLL);
         float s_p = read_float32_regs(s_holding_regs, REG_COV_SIGMA_PITCH);
@@ -1011,15 +994,15 @@ static void refresh_imu_registers(void)
         if (!(v_y == v_y) || (v_y < 0.0f) || (v_y > 1.0e6f)) { v_y = 0.0f; }
 
         /* 行主序：[0]Rxx [1]Rxy [2]Rxz [3]Ryx [4]Ryy [5]Ryz [6]Rzx [7]Rzy [8]Rzz */
-        write_float32_le(s_holding_regs, (uint16_t)(REG_IMU_ORICOV +  0U), v_r);
-        write_float32_le(s_holding_regs, (uint16_t)(REG_IMU_ORICOV +  2U), 0.0f);
-        write_float32_le(s_holding_regs, (uint16_t)(REG_IMU_ORICOV +  4U), 0.0f);
-        write_float32_le(s_holding_regs, (uint16_t)(REG_IMU_ORICOV +  6U), 0.0f);
-        write_float32_le(s_holding_regs, (uint16_t)(REG_IMU_ORICOV +  8U), v_p);
-        write_float32_le(s_holding_regs, (uint16_t)(REG_IMU_ORICOV + 10U), 0.0f);
-        write_float32_le(s_holding_regs, (uint16_t)(REG_IMU_ORICOV + 12U), 0.0f);
-        write_float32_le(s_holding_regs, (uint16_t)(REG_IMU_ORICOV + 14U), 0.0f);
-        write_float32_le(s_holding_regs, (uint16_t)(REG_IMU_ORICOV + 16U), v_y);
+        write_float32_regs(s_holding_regs, (uint16_t)(REG_IMU_ORICOV +  0U), v_r);
+        write_float32_regs(s_holding_regs, (uint16_t)(REG_IMU_ORICOV +  2U), 0.0f);
+        write_float32_regs(s_holding_regs, (uint16_t)(REG_IMU_ORICOV +  4U), 0.0f);
+        write_float32_regs(s_holding_regs, (uint16_t)(REG_IMU_ORICOV +  6U), 0.0f);
+        write_float32_regs(s_holding_regs, (uint16_t)(REG_IMU_ORICOV +  8U), v_p);
+        write_float32_regs(s_holding_regs, (uint16_t)(REG_IMU_ORICOV + 10U), 0.0f);
+        write_float32_regs(s_holding_regs, (uint16_t)(REG_IMU_ORICOV + 12U), 0.0f);
+        write_float32_regs(s_holding_regs, (uint16_t)(REG_IMU_ORICOV + 14U), 0.0f);
+        write_float32_regs(s_holding_regs, (uint16_t)(REG_IMU_ORICOV + 16U), v_y);
     }
 
     /* IST8310 磁力计诊断（2026-09-23）：
@@ -1027,9 +1010,9 @@ static void refresh_imu_registers(void)
      *   0x017E/80/82 原始磁场三轴 μT（未校准）。 */
     s_holding_regs[REG_AUTO_MAG_STATUS]  = (uint16_t)snap.mag_active;
     s_holding_regs[REG_MAG_INIT_ERR]     = (uint16_t)snap.mag_init_err;
-    write_float32_le(s_holding_regs, REG_MAG_X, snap.mag_x);
-    write_float32_le(s_holding_regs, REG_MAG_Y, snap.mag_y);
-    write_float32_le(s_holding_regs, REG_MAG_Z, snap.mag_z);
+    write_float32_regs(s_holding_regs, REG_MAG_X, snap.mag_x);
+    write_float32_regs(s_holding_regs, REG_MAG_Y, snap.mag_y);
+    write_float32_regs(s_holding_regs, REG_MAG_Z, snap.mag_z);
 
     /* 温度 ×10 存为有符号整数（诊断用）。钳位到 int16 范围防溢出。 */
     temp = snap.temperature;
@@ -1854,9 +1837,9 @@ void modbus_init(void)
      *    （镜像有效时）⇒ 改这里只影响"首次上电 / 镜像被拒"的场景。
      * 🔴 想让这三项"出厂即非零"，必须**同时升 FLASH_RETENTIVE_VERSION**，否则等于白烧 ——
      *    上电会被旧镜像整块盖回 0（0 方差 = "该姿态角不可信"，会让上位机直接丢弃姿态）。 */
-    write_float32_le(s_holding_regs, REG_COV_SIGMA_ROLL,  COV_SIGMA_ROLL_DEF);
-    write_float32_le(s_holding_regs, REG_COV_SIGMA_PITCH, COV_SIGMA_PITCH_DEF);
-    write_float32_le(s_holding_regs, REG_COV_SIGMA_YAW,   COV_SIGMA_YAW_DEF);
+    write_float32_regs(s_holding_regs, REG_COV_SIGMA_ROLL,  COV_SIGMA_ROLL_DEF);
+    write_float32_regs(s_holding_regs, REG_COV_SIGMA_PITCH, COV_SIGMA_PITCH_DEF);
+    write_float32_regs(s_holding_regs, REG_COV_SIGMA_YAW,   COV_SIGMA_YAW_DEF);
 
     MX_CAN1_Init();
     retentive_load_params();
@@ -1953,7 +1936,7 @@ void modbus_poll(void)
      *   ① 上电即显示真实目标（45.0f）；
      *   ② 上位机写 0x014D → ins_set_target_temp() 改的是同一份真值，
      *      下一轮镜像自然跟上，不会打架。 */
-    write_float32_le(s_holding_regs, REG_AUTO_HEATER_TARGET, ins_get_target_temp());
+    write_float32_regs(s_holding_regs, REG_AUTO_HEATER_TARGET, ins_get_target_temp());
 
     while (ring_len() > 0U)
     {

@@ -34,9 +34,6 @@
  *   CH1 = PH10 = 蓝
  *   CH2 = PH11 = 绿
  *   CH3 = PH12 = 红 */
-#define LED_TILT_R_CH   TIM_CHANNEL_3
-#define LED_TILT_G_CH   TIM_CHANNEL_2
-#define LED_TILT_B_CH   TIM_CHANNEL_1
 
 /* ---------- HSV -> RGB (0..1) ---------- */
 static void hsv_to_rgb01(float h_deg, float s, float v,
