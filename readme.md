@@ -97,7 +97,7 @@
 | ModbusTask | 5 ms | +4 | RS485 帧解析（裸寄存器中断收发）、Modbus 03/06/10/04 协议、**风机占空比输出**（自动前馈 / 手动跟随）、CAN 电机发送（HAL API）、CAN 接收队列排空、心跳超时、参数落盘 |
 | InsTask    | ~1 ms（DRDY 驱动）| +3 | BMI088 采样 + IST8310 磁场读取（100 Hz）→ Mahony **九轴**姿态解算 → 发布 seqlock 快照；恒温 PID（TIM10）；栈 512 字（含 sqrt/atan2 浮点库调用） |
 | PulseTask  | 10 ms| +2 | 500 ms 窗口 FG 测频、RPM 计算 |
-| AdcTask    | 12~16 ms/轮 | +2 | ADS1256 四路压力采集（SPI2：PB12 CS / PB13 SCLK / PB14 MISO / PB15 MOSI / PF1 DRDY）；每路丢弃第一拍，结果写 Modbus `0x01A8~0x01C3`；栈 384 字 |
+| AdcTask    | 12~16 ms/轮 | +1 | ADS1256 四路压力采集（SPI2：PB12 CS / PB13 SCLK / PB14 MISO / PB15 MOSI / PF1 DRDY）；每路丢弃第一拍，结果写 Modbus `0x01A8~0x01C3`；栈 384 字。**最低优先级**，且初始化在任务内执行（不在调度器启动前） |
 | LedTask    | 5 ms | +1 | RGB 倾斜指示灯（色相=倾斜方向，饱和度=幅度，亮度=系统状态） |
 
 > **风机输出只在 `ModbusTask` 里发生**：`modbus_poll()` → `fan_auto_update()`（自动模式，每 5 ms

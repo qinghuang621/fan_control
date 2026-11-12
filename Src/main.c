@@ -67,7 +67,9 @@ void SystemClock_Config(void);
 static void ModbusTask_Entry(void *argument);
 static void PulseTask_Entry(void *argument);
 static void LedTask_Entry(void *argument);
+#if ADS1256_ENABLE
 static void AdcTask_Entry(void *argument);
+#endif
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -139,8 +141,9 @@ static void LedTask_Entry(void *argument)
 }
 
 /* ADS1256 四路扫描任务。
- * 优先级 +2，与 PulseTask 同级；低于 ModbusTask(+4) 和 InsTask(+3)。
+ * 优先级 +1（最低，与 LedTask 同级）；低于 ModbusTask(+4)/InsTask(+3)/PulseTask(+2)。
  * 一轮扫描约 12~16ms（1kSPS、每路丢弃第一拍并等 1ms），约 60~80Hz/通道。 */
+#if ADS1256_ENABLE
 static void AdcTask_Entry(void *argument)
 {
    (void)argument;
@@ -183,6 +186,7 @@ static void AdcTask_Entry(void *argument)
        vTaskDelay(pdMS_TO_TICKS(1U));
    }
 }
+#endif /* ADS1256_ENABLE */
 
 /**
   * @brief  The application entry point.
@@ -217,7 +221,9 @@ int main(void)
   MX_TIM8_Init();
   MX_TIM1_Init();
   MX_SPI1_Init();
+#if ADS1256_ENABLE
   MX_SPI2_Init();
+#endif
   MX_TIM10_Init();
   MX_I2C3_Init();
   /* USB CDC 已废弃：CAN1 占用 PD0/PD1，且不再使用虚拟串口调试 */
@@ -244,17 +250,15 @@ int main(void)
     modbus_init();
 
     /* ADS1256 采集卡：SPI2(PB13/14/15) + CS(PB12) + DRDY(PF1)。
-     * 先初始化一次；失败由 AdcTask 每秒重试，不影响 Modbus/风机/电机。
-     * 初始化失败时立刻把错误码发到 0x01A8，避免上位机把“没起来”读成 0=正常。 */
-    {
-        uint8_t ads_ret = bsp_ads1256_init();
-        if (ads_ret != ADS1256_OK)
-        {
-            ads1256_snapshot_t ads0 = {0};
-            ads0.status = ads_ret;
-            modbus_ads_update(&ads0);
-        }
-    }
+     *
+     * 🔴 这里**不再**调用 bsp_ads1256_init()。
+     * 原因：本函数位于 vTaskStartScheduler() **之前**，而 ADS 初始化里有多处
+     * 阻塞等待（等 5V 稳定 100ms、软复位 100ms、DRDY 200/300ms、自校准 20ms）。
+     * 万一其中任何一处变成死等（时基不前进、DRDY 一直不低），芯片就永远停在
+     * 调度器启动之前 —— 所有任务都不跑，RS485 一个字节都不回，且从上位机看
+     * 和"固件刷坏了"完全一样，极难定位。
+     * 现在改成：全部初始化交给 AdcTask 首轮执行（任务里阻塞只影响它自己），
+     * 失败就按 1s 周期重试，并把错误码写进 0x01A8，Modbus/风机/电机不受影响。 */
 
     /* BMI088 恒温加热 PWM（TIM10 CH1 / PF6）先启动，占空比由 InsTask 的 PID 接管 */
     HAL_TIM_PWM_Start(&htim10, TIM_CHANNEL_1);
@@ -276,11 +280,16 @@ int main(void)
     {
         Error_Handler();
     }
-    /* ADS1256 四路扫描：与 PulseTask 同级(+2)，低于 Modbus(+4)/Ins(+3)。 */
-    if (xTaskCreate(AdcTask_Entry, "AdcTask", 384U, NULL, tskIDLE_PRIORITY + 2U, NULL) != pdPASS)
+    /* ADS1256 四路扫描：**最低优先级(+1)**，与 LedTask 同级。
+     * 采集是纯诊断/慢变量（每通道 60~80Hz 已经远快于压力变化），
+     * 没有任何理由让它和 Modbus(+4)/Ins(+3)/Pulse(+2) 抢 CPU；
+     * 降到 +1 后即使它偶发长时间阻塞，也抢不走通信任务的时间片。 */
+#if ADS1256_ENABLE
+    if (xTaskCreate(AdcTask_Entry, "AdcTask", 384U, NULL, tskIDLE_PRIORITY + 1U, NULL) != pdPASS)
     {
         Error_Handler();
     }
+#endif
     if (xTaskCreate(LedTask_Entry, "LedTask", 256U, NULL, tskIDLE_PRIORITY + 1U, NULL) != pdPASS)
     {
         Error_Handler();

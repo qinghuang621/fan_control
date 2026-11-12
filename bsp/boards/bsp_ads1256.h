@@ -3,6 +3,15 @@
 
 #include <stdint.h>
 
+/* ==================== 采集卡总开关 ====================
+ * 0 = 完全不启用：main 里不初始化 SPI2、不建 AdcTask，只保留编译。
+ * 用途：Modbus 不明原因全静默时，先用 ADS1256_ENABLE=0 烧一版做二分，
+ *       通了就说明问题在这条采集链路上。
+ * CMake 侧同名 option 会覆盖这里的默认值（-DADS1256_ENABLE=0）。 */
+#ifndef ADS1256_ENABLE
+#define ADS1256_ENABLE 1
+#endif
+
 /* ADS1256 状态码（与 Modbus 0x01A8 的 ADS_STATUS 一致） */
 #define ADS1256_OK          0U
 #define ADS1256_ERR_DRDY    1U  /* 等 DRDY 超时 */

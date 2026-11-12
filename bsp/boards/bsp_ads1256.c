@@ -124,9 +124,20 @@ static uint8_t ads_read_data(int32_t *code)
     return 0U;
 }
 
+/* 等 DRDY 拉低（低=新数据就绪）。
+ *
+ * 🔴 双重超时，缺一不可：
+ *   ① tick 超时：正常路径，靠 HAL_GetTick() 前进（TIM6 时基）。
+ *   ② 迭代上限：兜底。若 uwTick 因为时基停摆/中断被长时间屏蔽而**不再前进**，
+ *      ①里的 `HAL_GetTick() - t0` 会永远等于 0，判断永不成立 —— 这个循环就会
+ *      变成没有超时的死等。本函数在 main() 里、调度器启动之前就会被调用，
+ *      一旦死在这里，整个固件再也起不来（表现为 RS485 一个字节都不回）。
+ *   所以循环体**不能用 HAL_Delay()**（它本身也依赖 uwTick，同样会死），
+ *   改用不依赖任何时基的忙等 ads_delay_us()。 */
 static uint8_t ads_wait_drdy(uint32_t timeout_ms)
 {
     uint32_t t0 = HAL_GetTick();
+    uint32_t iter = 0U;
 
     while (ADS_DRDY_READ() != GPIO_PIN_RESET)
     {
@@ -134,7 +145,12 @@ static uint8_t ads_wait_drdy(uint32_t timeout_ms)
         {
             return 1U;
         }
-        HAL_Delay(1U);
+        /* 每次迭代约 1ms；给 200ms 余量吸收忙等误差 */
+        if (++iter > (timeout_ms + 200U))
+        {
+            return 1U;
+        }
+        ads_delay_us(1000U);
     }
     return 0U;
 }
