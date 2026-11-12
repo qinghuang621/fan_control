@@ -5,6 +5,7 @@
 #include "usart.h"
 #include "bsp_fric.h"
 #include "bsp_pulse.h"
+#include "bsp_ads1256.h"
 #include "ins_task.h"
 
 /* CAN 使用 HAL API + 中断队列（对齐 running），邮箱等待需 vTaskDelay() 让出 CPU */
@@ -306,6 +307,17 @@ static uint32_t modbus_t35_gap_ms(uint32_t baud)
                                      * 顺序 (roll, pitch, yaw)：对角=方差，其余 6 个恒 0。
                                      * 取值来源见 s_cov_sigma_* 与协方差发布处的说明。 */
 #define REG_IMU_ORICOV_END 0x01A7U
+
+/* ==================== ADS1256 采集卡输出区 0x01A8~0x01C3（只读） ====================
+ * 四路压力/电压；落在保留区，不在断电保持段（0x0090~0x0173），不会触发 Flash 落盘。
+ * float32 一律高字在前，与现有约定一致。 */
+#define REG_ADS_STATUS     0x01A8U
+#define REG_ADS_SEQ        0x01A9U
+#define REG_ADS_V_BASE     0x01AAU  /* V0~V3，4×float32，0x01AA~0x01B1 */
+#define REG_ADS_RAW_BASE   0x01B2U  /* RAW0~RAW3，4×int32，0x01B2~0x01B9 */
+#define REG_ADS_V5V        0x01BAU  /* float32，0x01BA~0x01BB（暂未实现，恒 0） */
+#define REG_ADS_P_BASE     0x01BCU  /* P0~P3，4×float32，0x01BC~0x01C3（暂未实现，恒 0） */
+#define REG_ADS_END        0x01C3U
 
 /* ---- 协方差的 σ：可写 + 断电保持，单位【度】 ----
  * 落在保持区空地 0x00C0~0x00C5（原先恒 0、全仓无代码引用）。
@@ -678,6 +690,12 @@ static uint8_t is_imu_status_region(uint16_t addr)
            ((addr >= REG_IMU_QUAT_W) && (addr <= REG_IMU_QUAT_END)) ||
            ((addr >= REG_MAG_INIT_ERR) && (addr <= REG_MAG_END)) ||
            ((addr >= REG_IMU_ACCEL_X) && (addr <= REG_IMU_ORICOV_END));
+}
+
+/* ADS1256 输出区只读：0x01A8~0x01C3 由 AdcTask 每轮覆盖，上位机写入一律忽略。 */
+static uint8_t is_ads_region(uint16_t addr)
+{
+    return (addr >= REG_ADS_STATUS) && (addr <= REG_ADS_END);
 }
 
 static uint8_t get_modbus_slave_addr(void)
@@ -1169,6 +1187,34 @@ static void write_float32_regs(uint16_t *regs, uint16_t addr, float value)
     regs[(uint16_t)(addr + 1U)] = (uint16_t)(conv.u32 & 0xFFFFU);
 }
 
+/* AdcTask 调用：把一次四路扫描快照写进 0x01A8~0x01C3。
+ * 整段用临界区包住，避免上位机读到半新半旧的 float32 对。 */
+void modbus_ads_update(const ads1256_snapshot_t *snap)
+{
+    if (snap == 0)
+    {
+        return;
+    }
+
+    taskENTER_CRITICAL();
+    s_holding_regs[REG_ADS_STATUS] = snap->status;
+    s_holding_regs[REG_ADS_SEQ] = snap->seq;
+
+    for (uint8_t i = 0U; i < 4U; ++i)
+    {
+        uint32_t raw = (uint32_t)snap->raw[i];
+        uint16_t raw_addr = (uint16_t)(REG_ADS_RAW_BASE + (uint16_t)(i * 2U));
+
+        write_float32_regs(s_holding_regs, (uint16_t)(REG_ADS_V_BASE + (uint16_t)(i * 2U)), snap->volt[i]);
+        s_holding_regs[raw_addr]       = (uint16_t)((raw >> 16U) & 0xFFFFU);
+        s_holding_regs[raw_addr + 1U]  = (uint16_t)(raw & 0xFFFFU);
+        write_float32_regs(s_holding_regs, (uint16_t)(REG_ADS_P_BASE + (uint16_t)(i * 2U)), snap->pressure[i]);
+    }
+
+    write_float32_regs(s_holding_regs, REG_ADS_V5V, snap->v5v);
+    taskEXIT_CRITICAL();
+}
+
 /* ===== 运动学：与 running 项目 Core/Src/kinematics.c 保持一致 =====
  *
  * 底盘构型：4 个正交全向轮
@@ -1551,6 +1597,12 @@ static void modbus_write_single_register(uint16_t addr, uint16_t value)
 
     /* IMU 姿态输出区只读 */
     if (is_imu_status_region(addr))
+    {
+        return;
+    }
+
+    /* ADS1256 输出区只读 */
+    if (is_ads_region(addr))
     {
         return;
     }

@@ -35,11 +35,15 @@ extern SPI_HandleTypeDef hspi1;
 extern DMA_HandleTypeDef hdma_spi1_rx;
 extern DMA_HandleTypeDef hdma_spi1_tx;
 
+/* ADS1256 采集卡专用 SPI2（PB13/14/15，AF5）。SPI1 仍归 BMI088，互不影响。 */
+extern SPI_HandleTypeDef hspi2;
+
 /* USER CODE BEGIN Private defines */
 
 /* USER CODE END Private defines */
 
 void MX_SPI1_Init(void);
+void MX_SPI2_Init(void);
 
 /* USER CODE BEGIN Prototypes */
 

@@ -13,7 +13,7 @@
 
 硬件平台：**STM32F407IGH6**（UFBGA176 封装，1 MB Flash / 128 KB SRAM + 64 KB CCMRAM）——
 以 `.ioc` 的 `Mcu.CPN` 与 `STM32F407xx_FLASH.ld` 的存储器布局为准。
-软件架构：FreeRTOS **4 个任务**（`ModbusTask` / `InsTask` / `PulseTask` / `LedTask`，按优先级降序），1 ms HAL 时基（TIM6）+ FreeRTOS SysTick 节拍（`xPortSysTickHandler`），Cortex-M4F 168 MHz。
+软件架构：FreeRTOS **5 个任务**（`ModbusTask` / `InsTask` / `PulseTask` / `AdcTask` / `LedTask`，按优先级降序），1 ms HAL 时基（TIM6）+ FreeRTOS SysTick 节拍（`xPortSysTickHandler`），Cortex-M4F 168 MHz。
 
 ### 参考资料
 
@@ -90,13 +90,14 @@
 
 > **C 板的 CAN1 在 PD0/PD1**（PA11/PA12 是 USB_OTG_FS 的 DM/DP，别接错）。
 
-## 3. 软件架构（FreeRTOS 4 任务）
+## 3. 软件架构（FreeRTOS 5 任务）
 
 | 任务 | 周期 | 优先级 | 职责 |
 |------|------|--------|------|
 | ModbusTask | 5 ms | +4 | RS485 帧解析（裸寄存器中断收发）、Modbus 03/06/10/04 协议、**风机占空比输出**（自动前馈 / 手动跟随）、CAN 电机发送（HAL API）、CAN 接收队列排空、心跳超时、参数落盘 |
 | InsTask    | ~1 ms（DRDY 驱动）| +3 | BMI088 采样 + IST8310 磁场读取（100 Hz）→ Mahony **九轴**姿态解算 → 发布 seqlock 快照；恒温 PID（TIM10）；栈 512 字（含 sqrt/atan2 浮点库调用） |
 | PulseTask  | 10 ms| +2 | 500 ms 窗口 FG 测频、RPM 计算 |
+| AdcTask    | 12~16 ms/轮 | +2 | ADS1256 四路压力采集（SPI2：PB12 CS / PB13 SCLK / PB14 MISO / PB15 MOSI / PF1 DRDY）；每路丢弃第一拍，结果写 Modbus `0x01A8~0x01C3`；栈 384 字 |
 | LedTask    | 5 ms | +1 | RGB 倾斜指示灯（色相=倾斜方向，饱和度=幅度，亮度=系统状态） |
 
 > **风机输出只在 `ModbusTask` 里发生**：`modbus_poll()` → `fan_auto_update()`（自动模式，每 5 ms
@@ -246,8 +247,10 @@ cmake --build build/Debug -- -j 8
 已具备的能力：
 
 - 4 路 FG 反馈采集（TIM1_CH1~CH4 输入捕获，500 ms 测频）+ 3 路 20 kHz PWM 输出（TIM8_CH1~CH3）
-- FreeRTOS 4 任务（ModbusTask / InsTask / PulseTask / LedTask），1 ms SysTick + 1 ms TIM6 HAL 时基
+- FreeRTOS 5 任务（ModbusTask / InsTask / PulseTask / AdcTask / LedTask），1 ms SysTick + 1 ms TIM6 HAL 时基
 - RS485 Modbus RTU 从站（03/04/06/10，0x0100 风机 + 0x0000 电机双区）
+- **ADS1256 四路 24bit 压力采集**（SPI2：PB12 CS / PB13 SCLK / PB14 MISO / PB15 MOSI / PF1 DRDY），
+  单端 ACOM=0V、BUFEN=0（0~5V 量程），Modbus 只读区 `0x01A8~0x01C3`
 - 1 Mbps CAN 电机控制（PD0/PD1，AF9）+ 正交全向轮运动学解算
 - 通信丢失保护 / NaN 防护 / 500 ms 心跳超时
 - 参数区 Flash A/B 双区断电保持，2 s 落盘防抖（`crc` 置于镜像块末尾，`FLASH_RETENTIVE_VERSION = 3`）

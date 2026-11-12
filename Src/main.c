@@ -36,6 +36,7 @@
 #include "bsp_led_tilt.h"
 #include "bsp_modbus.h"
 #include "bsp_pulse.h"
+#include "bsp_ads1256.h"
 #include "ins_task.h"
 
 /* USER CODE END Includes */
@@ -66,6 +67,7 @@ void SystemClock_Config(void);
 static void ModbusTask_Entry(void *argument);
 static void PulseTask_Entry(void *argument);
 static void LedTask_Entry(void *argument);
+static void AdcTask_Entry(void *argument);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -136,6 +138,52 @@ static void LedTask_Entry(void *argument)
    }
 }
 
+/* ADS1256 四路扫描任务。
+ * 优先级 +2，与 PulseTask 同级；低于 ModbusTask(+4) 和 InsTask(+3)。
+ * 一轮扫描约 12~16ms（1kSPS、每路丢弃第一拍并等 1ms），约 60~80Hz/通道。 */
+static void AdcTask_Entry(void *argument)
+{
+   (void)argument;
+
+   /* 保留最后一次成功扫描的数据：故障时只更新 status，不清零 SEQ/电压，
+    * 这样上位机能区分“压力真的是 0”和“采集卡掉线”。 */
+   static ads1256_snapshot_t s_last;
+   s_last.status = ADS1256_ERR_INIT;
+
+   for (;;)
+   {
+       ads1256_snapshot_t snap = {0};
+
+       if (bsp_ads1256_is_ready() == 0U)
+       {
+           uint8_t ret = bsp_ads1256_init();
+           if (ret != ADS1256_OK)
+           {
+               s_last.status = ret;          /* 1=DRDY 超时 2=初始化失败 3=SPI 错误 */
+               modbus_ads_update(&s_last);
+               vTaskDelay(pdMS_TO_TICKS(1000U));
+               continue;
+           }
+           /* 初始化成功：直接往下扫描，不额外延时 */
+       }
+
+       if (bsp_ads1256_scan(&snap) != ADS1256_OK)
+       {
+           /* 扫描失败：保留上次成功的 SEQ/电压，只把错误码写进 status */
+           s_last.status = snap.status;
+           modbus_ads_update(&s_last);
+           vTaskDelay(pdMS_TO_TICKS(100U));
+           (void)bsp_ads1256_init();
+           vTaskDelay(pdMS_TO_TICKS(1000U));
+           continue;
+       }
+
+       s_last = snap;
+       modbus_ads_update(&s_last);
+       vTaskDelay(pdMS_TO_TICKS(1U));
+   }
+}
+
 /**
   * @brief  The application entry point.
   * @retval int
@@ -169,6 +217,7 @@ int main(void)
   MX_TIM8_Init();
   MX_TIM1_Init();
   MX_SPI1_Init();
+  MX_SPI2_Init();
   MX_TIM10_Init();
   MX_I2C3_Init();
   /* USB CDC 已废弃：CAN1 占用 PD0/PD1，且不再使用虚拟串口调试 */
@@ -194,6 +243,19 @@ int main(void)
     /* 初始化 RS485 Modbus RTU 从站 */
     modbus_init();
 
+    /* ADS1256 采集卡：SPI2(PB13/14/15) + CS(PB12) + DRDY(PF1)。
+     * 先初始化一次；失败由 AdcTask 每秒重试，不影响 Modbus/风机/电机。
+     * 初始化失败时立刻把错误码发到 0x01A8，避免上位机把“没起来”读成 0=正常。 */
+    {
+        uint8_t ads_ret = bsp_ads1256_init();
+        if (ads_ret != ADS1256_OK)
+        {
+            ads1256_snapshot_t ads0 = {0};
+            ads0.status = ads_ret;
+            modbus_ads_update(&ads0);
+        }
+    }
+
     /* BMI088 恒温加热 PWM（TIM10 CH1 / PF6）先启动，占空比由 InsTask 的 PID 接管 */
     HAL_TIM_PWM_Start(&htim10, TIM_CHANNEL_1);
 
@@ -211,6 +273,11 @@ int main(void)
         Error_Handler();
     }
     if (xTaskCreate(PulseTask_Entry, "PulseTask", 256U, NULL, tskIDLE_PRIORITY + 2U, NULL) != pdPASS)
+    {
+        Error_Handler();
+    }
+    /* ADS1256 四路扫描：与 PulseTask 同级(+2)，低于 Modbus(+4)/Ins(+3)。 */
+    if (xTaskCreate(AdcTask_Entry, "AdcTask", 384U, NULL, tskIDLE_PRIORITY + 2U, NULL) != pdPASS)
     {
         Error_Handler();
     }

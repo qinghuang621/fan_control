@@ -68,7 +68,9 @@
 #define configTICK_RATE_HZ                       ((TickType_t)1000)
 #define configMAX_PRIORITIES                     ( 56 )
 #define configMINIMAL_STACK_SIZE                 ((uint16_t)128)
-#define configTOTAL_HEAP_SIZE                    ((size_t)8192)
+/* 5 个任务栈 + TCB + CAN 接收队列约 7.5KB；原 8KB 只剩 ~0.6KB 余量。
+ * 加到 12KB，留约 4.5KB 余量；RAM 128KB，占用仍很低。 */
+#define configTOTAL_HEAP_SIZE                    ((size_t)12288)
 #define configMAX_TASK_NAME_LEN                  ( 16 )
 #define configUSE_TRACE_FACILITY                 1
 #define configUSE_16_BIT_TICKS                   0
