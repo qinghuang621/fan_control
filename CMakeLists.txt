@@ -92,11 +92,9 @@ target_include_directories(FreeRTOS PUBLIC
 )
 target_link_libraries(FreeRTOS PUBLIC stm32cubemx)
 
-# ===== ADS1256 采集卡总开关 =====
-# ON  = 正常启用（SPI2 + AdcTask + 0x01A8 输出区）
-# OFF = 整段关掉，只用于二分定位：Modbus 不明原因全静默时，
-#       用 -DADS1256_ENABLE=OFF 重新 configure+build，烧进去能通就说明
-#       问题在这条采集链路上（详见 bsp/boards/bsp_ads1256.h 顶部注释）。
+# ===== ADS1256 采集卡编译开关（默认 ON，一般不用动）=====
+# ON  = 启用（SPI2 + AdcTask + 0x01A8 输出区）
+# OFF = 整段不编译该链路，仅用于新旧固件 A/B 对比。
 option(ADS1256_ENABLE "Enable ADS1256 pressure acquisition (SPI2 + AdcTask)" ON)
 
 # Add project symbols (macros)
