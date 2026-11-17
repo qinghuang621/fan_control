@@ -150,6 +150,16 @@ static const uint8_t c_cmd_clear_err[8] = {0xFFU, 0xFFU, 0xFFU, 0xFFU, 0xFFU, 0x
 #define MOTOR_CAN_TX_WAIT_TICKS 5U
 #define REG_FAN_DUTY_BASE 0x0100U
 #define REG_FAN_CNT 4U
+/* 遥控手动档位入口（易失，不落盘）：写它等价于同时设定 0x0100~0x0103。
+ * 放在 0x0184（磁力计诊断区 0x017C~0x0183 之后的保留空洞），
+ * 不在保持区 0x0090~0x0173 内，因此写入不会置 s_param_dirty，
+ * 不会触发 Flash 擦写和 1~2 s 的全固件停顿。 */
+#define REG_FAN_MANUAL_CMD 0x0184U
+/* 强制停止风机（易失，不落盘）：1=三路 PWM 强制 0，0=恢复当前手动档位/自动模式。
+ * 同样在保持区外，写入不触发 Flash 落盘；上电由 memset/初始化清零，即断电后自动恢复 30% 档。 */
+#define REG_FAN_FORCE_STOP 0x0185U
+#define FAN_MANUAL_DUTY_MIN 30U
+#define FAN_MANUAL_DUTY_MAX 100U
 /* 风机状态区：本工程后加，独立放在 0x0110 起，**不得**占用 running 的电机状态区
  * （0x0064/0x006E/0x0078/0x0082）。每台风機 10 个寄存器，布局沿用电机状态语义：
  * +0 ERR / +1 保留 / +2+3 POS / +4+5 VEL / +6+7 T / +8 T_MOS / +9 T_Rotor */
@@ -656,6 +666,20 @@ static uint16_t clamp_duty(uint16_t v)
     return v;
 }
 
+/* 遥控手动档位 30~100：下限 30 是吸附力安全下限，不允许通过遥控关到 0。 */
+static uint16_t clamp_fan_gear(uint16_t v)
+{
+    if (v < FAN_MANUAL_DUTY_MIN)
+    {
+        return FAN_MANUAL_DUTY_MIN;
+    }
+    if (v > FAN_MANUAL_DUTY_MAX)
+    {
+        return FAN_MANUAL_DUTY_MAX;
+    }
+    return v;
+}
+
 static uint8_t is_can_status_region(uint16_t addr)
 {
     return (addr >= REG_CAN_STATUS_BASE) && (addr <= REG_CAN_STATUS_END);
@@ -830,6 +854,16 @@ static void fan_auto_update(void)
     float duty_f;
     uint16_t duty_min, duty_max, mode;
     uint16_t out;
+
+    /* 强制停止优先于手动/自动：0x0185 != 0 时三路 PWM 全部 0。 */
+    if (s_holding_regs[REG_FAN_FORCE_STOP] != 0U)
+    {
+        fan_auto_duty = 0U;
+        fric_set_channel_duty(1U, 0U);
+        fric_set_channel_duty(2U, 0U);
+        fric_set_channel_duty(3U, 0U);
+        return;
+    }
 
     /* 手动模式（或自动总开关关闭）：`0x0100~0x0103` 是唯一真值来源，直接推给硬件。
      * ⚠️ **必须在启动后也走到这一句** —— `sync_fan_outputs_from_regs()` 以前只在上位机
@@ -1607,6 +1641,47 @@ static void modbus_write_single_register(uint16_t addr, uint16_t value)
         return;
     }
 
+    /* 遥控手动档位入口 0x0184：易失，不落盘。
+     * 写它等价于同时更新 0x0100~0x0103 并立即同步 PWM；
+     * 不在保持区，不能走下面的通用脏标志逻辑。 */
+    if (addr == REG_FAN_MANUAL_CMD)
+    {
+        uint16_t duty = clamp_fan_gear(value);
+        s_holding_regs[REG_FAN_MANUAL_CMD] = duty;
+        for (uint16_t i = 0U; i < REG_FAN_CNT; ++i)
+        {
+            s_holding_regs[REG_FAN_DUTY_BASE + i] = duty;
+        }
+        /* 只有手动输出真正生效时才同步，避免自动模式下短暂覆盖前馈输出。 */
+        if ((s_holding_regs[REG_AUTO_FAN_MODE] == 0U) ||
+            (s_holding_regs[REG_AUTO_FAN_AUTO_EN] == 0U))
+        {
+            sync_fan_outputs_from_regs();
+        }
+        return;
+    }
+
+    /* 强制停止风机 0x0185：易失，不落盘；1=停止，0=恢复当前档位/自动模式。 */
+    if (addr == REG_FAN_FORCE_STOP)
+    {
+        uint16_t stop = (value != 0U) ? 1U : 0U;
+        s_holding_regs[REG_FAN_FORCE_STOP] = stop;
+        if (stop != 0U)
+        {
+            /* 立即置 0；后续每 5ms 的 fan_auto_update() 也会继续压住。 */
+            fan_auto_duty = 0U;
+            fric_set_channel_duty(1U, 0U);
+            fric_set_channel_duty(2U, 0U);
+            fric_set_channel_duty(3U, 0U);
+            refresh_fan_state_registers();
+        }
+        else
+        {
+            fan_auto_update();
+        }
+        return;
+    }
+
     if ((addr >= REG_MOTOR_EN_BASE) && (addr <= (REG_MOTOR_WZ_HI + 1U)))
     {
         s_holding_regs[addr] = value;
@@ -1898,6 +1973,17 @@ void modbus_init(void)
 
     MX_CAN1_Init();
     retentive_load_params();
+
+    /* 手动档位默认 30%：只改 RAM，不置脏、不落盘。
+     * 必须在 retentive_load_params() 之后执行，才能覆盖 Flash 里可能残留的旧手动值；
+     * 0x0100~0x0103 是实际输出真值，0x0184 是遥控档位的读回入口。
+     * 这里不强制 FAN_MODE/AUTO_EN：手动模式由上位机提前写好并保持在 Flash 中。 */
+    for (uint16_t i = 0U; i < REG_FAN_CNT; ++i)
+    {
+        s_holding_regs[REG_FAN_DUTY_BASE + i] = FAN_MANUAL_DUTY_MIN;
+    }
+    s_holding_regs[REG_FAN_MANUAL_CMD] = FAN_MANUAL_DUTY_MIN;
+
     /* 保持区加载（可能覆盖上面的默认 1）后，把最终使能值同步给 InsTask。
      * InsTask 虽然后面才创建，但 ins_set_mag_enable 只写静态变量，此时调用安全。 */
     ins_set_mag_enable((uint8_t)(s_holding_regs[REG_AUTO_MAG_ENABLE] != 0U));
